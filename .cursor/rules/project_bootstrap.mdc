@@ -1,0 +1,15 @@
+---
+alwaysApply: true
+---
+
+# Project Bootstrap Rule
+
+Always read these files at the start of every new chat session:
+
+- `pionex_futures_bot_setup.md`
+- `pionex_futures_bot/OPERATIONS.md`
+
+Purpose:
+- Ensure the assistant aligns with the project context, goals, constraints, and operational procedures each time.
+- Avoid Linux shell assumptions. Use Windows PowerShell syntax and prefer `py` for Python launcher. Use the venv Python for project execution.
+- Prefer short commands and `.venv` as the default virtual environment folder name; adapt paths if a custom name is used.

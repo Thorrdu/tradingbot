@@ -1,0 +1,52 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+pionex_futures_bot/.venv/
+pionex_futures_bot/venv/
+
+# Environment files
+.env
+.env.*
+!*.env.example
+pionex_futures_bot/.env
+
+# Logs and runtime files
+*.log
+*.pid
+pionex_futures_bot/bot_dryrun.log
+
+# Data/outputs generated at runtime
+pionex_futures_bot/trades.csv
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test and coverage caches
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage/
+htmlcov/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Editor/IDE (keep project rules under .cursor tracked unless specified)
+.vscode/
+.idea/
+
+# Tool caches
+tools/__pycache__/
+
+# Large external docs (local scrape output)
+# Comment the next line if you want to version scraped docs
+pionex doc/
