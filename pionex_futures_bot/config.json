@@ -9,6 +9,6 @@
   "take_profit_percent": 3.0,
   "check_interval_sec": 5,
   "cooldown_sec": 300,
-  "dry_run": true,
+  "dry_run": false,
   "log_csv": "trades.csv"
 } 

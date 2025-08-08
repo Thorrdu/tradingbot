@@ -109,6 +109,31 @@ class PionexClient:
             sign_payload = f"{sign_payload}{body_str}"
         return self._hmac_hex(sign_payload)
 
+    def _signed_get(self, path: str, params: Dict[str, Any]) -> ApiResponse:
+        """Private GET with timestamp and signature.
+        Returns ApiResponse with JSON on success.
+        """
+        self.rate_limiter.wait("ip", weight=1)
+        self.rate_limiter.wait("account", weight=1)
+        url = f"{self.base_url}{path}"
+        timestamp_ms = str(int(time.time() * 1000))
+        qp: Dict[str, str] = {k: str(v) for k, v in params.items()}
+        qp["timestamp"] = timestamp_ms
+        signature = self._build_signature(method="GET", path=path, query_params=qp, body_str=None)
+        headers = {
+            self.api_key_header: self.api_key,
+            "PIONEX-SIGNATURE": signature,
+        }
+        try:
+            self.log.debug("GET %s params=%s", url, qp)
+            r = self.session.get(url, params=qp, headers=headers, timeout=self.timeout_sec)
+            if r.status_code == 429:
+                return ApiResponse(ok=False, data=None, error="rate_limited")
+            r.raise_for_status()
+            return ApiResponse(ok=True, data=r.json(), error=None)
+        except Exception as exc:  # noqa: BLE001
+            return ApiResponse(ok=False, data=None, error=str(exc))
+
     def get_price(self, symbol: str) -> ApiResponse:
         """Fetch latest price using documented endpoints with fallbacks.
         References: Markets → Get 24hr Ticker, Get Book Ticker, Get Trades
@@ -264,6 +289,60 @@ class PionexClient:
                 return ApiResponse(ok=True, data=r.json(), error=None)
             except Exception as exc:  # noqa: BLE001
                 return ApiResponse(ok=False, data=None, error=str(exc))
+
+    # ---- Private data helpers -------------------------------------------------
+
+    def get_open_orders(self, symbol: str) -> ApiResponse:
+        path = "/api/v1/trade/openOrders"
+        params: Dict[str, Any] = {"symbol": self._normalize_symbol(symbol)}
+        return self._signed_get(path, params)
+
+    def get_fills(self, symbol: str, limit: int = 50) -> ApiResponse:
+        path = "/api/v1/trade/fills"
+        params: Dict[str, Any] = {"symbol": self._normalize_symbol(symbol), "limit": limit}
+        return self._signed_get(path, params)
+
+    def infer_position_from_fills(self, symbol: str, limit: int = 50) -> Dict[str, Any]:
+        """Heuristic: compute net size from recent fills to estimate open position.
+
+        Returns dict with keys: in_position, side, quantity, entry_price.
+        """
+        out = {"in_position": False, "side": None, "quantity": 0.0, "entry_price": 0.0}
+        try:
+            fills_resp = self.get_fills(symbol, limit)
+            if not fills_resp.ok or not fills_resp.data:
+                return out
+            data = fills_resp.data.get("data") if isinstance(fills_resp.data, dict) else None
+            fills = data.get("fills") if isinstance(data, dict) else None
+            if not isinstance(fills, list):
+                return out
+            net_qty = 0.0
+            last_price = 0.0
+            for f in fills:
+                if not isinstance(f, dict):
+                    continue
+                side = f.get("side")
+                size = f.get("size")
+                price = f.get("price")
+                try:
+                    qty = float(size) if size is not None else 0.0
+                    px = float(price) if price is not None else 0.0
+                except Exception:
+                    continue
+                if side == "BUY":
+                    net_qty += qty
+                    last_price = px
+                elif side == "SELL":
+                    net_qty -= qty
+                    last_price = px
+            if abs(net_qty) > 0.0:
+                out["in_position"] = True
+                out["side"] = "BUY" if net_qty > 0 else "SELL"
+                out["quantity"] = abs(net_qty)
+                out["entry_price"] = last_price
+            return out
+        except Exception:
+            return out
 
     def close_position(
         self,

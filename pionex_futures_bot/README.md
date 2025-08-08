@@ -80,3 +80,17 @@ Get-Item .\trades.csv | Select-Object Name,Length,LastWriteTime
   - Exécution: `py bot.py`
 
 Remarque: Les endpoints utilisés imitent une API de style MBX (signature HMAC-SHA256). Vérifiez les spécifications Pionex réelles et adaptez `pionex_client.py` si nécessaire. 
+
+## Robustesse & reprise après incident
+
+- Persistance locale d’état (`runtime_state.json`) via `StateStore`:
+  - Sauvegarde à l’entrée de position: `in_position`, `side`, `quantity`, `entry_price`, `stop_loss`, `take_profit`, `order_id`, `last_exit_time`.
+  - Reprise au redémarrage: rechargement par symbole et remise en cohérence du compteur global de positions.
+- Réconciliation côté API (best-effort): au redémarrage, si aucune persistance locale, le bot tente d’inférer une position ouverte à partir des derniers fills (`GET /api/v1/trade/fills`).
+- Rate limit: limiteur 10 req/s par IP/compte, backoff exponentiel sur 429/5xx.
+- Backoff symbole hors position quand `max_open_trades` atteint: évite des appels marché inutiles.
+
+### Paramètres utiles (dans `config.json`)
+- `idle_backoff_sec`: délai d’attente quand `max_open_trades` est atteint et que le symbole n’est pas en position (défaut: 6× `check_interval_sec`, min 10s).
+- `dry_run`: true/false.
+- `breakout_change_percent`, `check_interval_sec`.

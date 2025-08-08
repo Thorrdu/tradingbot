@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from pionex_client import PionexClient
 from strategy import compute_breakout_signal, compute_sl_tp_prices
 from trade_logger import TradeLogger
+from state_store import StateStore
 
 
 @dataclass
@@ -63,9 +64,12 @@ class FuturesBot:
         self.stop_loss_percent = float(self.config["stop_loss_percent"])
         self.take_profit_percent = float(self.config["take_profit_percent"])
         self.check_interval_sec = int(self.config["check_interval_sec"])
+        # Backoff used when this symbol is not in position and max_open_trades is reached
+        self.idle_backoff_sec = int(self.config.get("idle_backoff_sec", max(10, self.check_interval_sec * 6)))
         self.cooldown_sec = int(self.config["cooldown_sec"])
 
         self.logger = TradeLogger(self.config.get("log_csv", "trades.csv"))
+        self.state_store = StateStore(self.config.get("state_file", "runtime_state.json"))
         self._states: Dict[str, SymbolState] = {s: SymbolState() for s in self.symbols}
         self._open_trades_lock = threading.Lock()
         self._open_trades_count = 0
@@ -104,6 +108,41 @@ class FuturesBot:
         threading.current_thread().name = thread_name
         self.log.info("Worker started for %s", symbol)
 
+        # Attempt resume from persisted state
+        persisted = self.state_store.load().get(symbol)
+        if persisted and isinstance(persisted, dict):
+            try:
+                state.in_position = bool(persisted.get("in_position", False))
+                state.side = persisted.get("side")
+                state.quantity = float(persisted.get("quantity", 0.0))
+                state.entry_price = float(persisted.get("entry_price", 0.0))
+                state.stop_loss = float(persisted.get("stop_loss", 0.0))
+                state.take_profit = float(persisted.get("take_profit", 0.0))
+                state.order_id = persisted.get("order_id")
+                state.last_exit_time = float(persisted.get("last_exit_time", 0.0))
+                self.log.info("%s resume: in_position=%s side=%s qty=%.6f entry=%.8f", symbol, state.in_position, state.side, state.quantity, state.entry_price)
+                if state.in_position:
+                    with self._open_trades_lock:
+                        self._open_trades_count = min(self._open_trades_count + 1, self.max_open_trades)
+            except Exception:
+                pass
+
+        # If no persisted position, try to infer from recent fills (best-effort)
+        if not state.in_position:
+            inferred = self.client.infer_position_from_fills(symbol)
+            if inferred.get("in_position"):
+                state.in_position = True
+                state.side = inferred.get("side")
+                state.quantity = float(inferred.get("quantity", 0.0))
+                state.entry_price = float(inferred.get("entry_price", 0.0))
+                self.log.info(
+                    "%s inferred position from fills: side=%s qty=%.6f entry=%.8f",
+                    symbol,
+                    state.side,
+                    state.quantity,
+                    state.entry_price,
+                )
+
         # Initialize last price
         while state.last_price is None:
             resp = self.client.get_price(symbol)
@@ -120,6 +159,15 @@ class FuturesBot:
 
         # Main loop
         while True:
+            # Throttle symbols that cannot enter because global max is reached
+            if (not state.in_position) and (not self._can_open_more()):
+                # Log a heartbeat less frequently, then back off without hitting the API
+                if tick % heartbeat_every == 0:
+                    self.log.info("%s heartbeat: max_open_trades reached, skipping price fetch for %ss", symbol, self.idle_backoff_sec)
+                time.sleep(self.idle_backoff_sec)
+                tick += 1
+                continue
+
             price_resp = self.client.get_price(symbol)
             if not price_resp.ok or not price_resp.data or "price" not in price_resp.data:
                 self.log.warning("%s price fetch failed: %s", symbol, getattr(price_resp, "error", None))
@@ -203,6 +251,20 @@ class FuturesBot:
                             str(order.data.get("orderId")) if order.data else None  # type: ignore[union-attr]
                         )
                         self._on_open()
+                        # Persist state for resume
+                        self.state_store.update_symbol(
+                            symbol,
+                            {
+                                "in_position": True,
+                                "side": state.side,
+                                "quantity": state.quantity,
+                                "entry_price": state.entry_price,
+                                "stop_loss": state.stop_loss,
+                                "take_profit": state.take_profit,
+                                "order_id": state.order_id,
+                                "last_exit_time": state.last_exit_time,
+                            },
+                        )
                         self.logger.log(
                             event="entry",
                             symbol=symbol,
@@ -285,6 +347,21 @@ class FuturesBot:
                     state.order_id = None
                     state.last_exit_time = time.time()
                     self._on_close()
+                    # Clear persisted state
+                    self.state_store.clear_symbol(symbol)
+                else:
+                    # Position heartbeat for visibility
+                    if tick % heartbeat_every == 0:
+                        self.log.info(
+                            "%s position heartbeat side=%s entry=%.8f sl=%.8f tp=%.8f price=%.8f qty=%.6f",
+                            symbol,
+                            state.side,
+                            state.entry_price,
+                            state.stop_loss,
+                            state.take_profit,
+                            price,
+                            state.quantity,
+                        )
                 # always refresh last price
                 state.last_price = price
                 time.sleep(self.check_interval_sec)
