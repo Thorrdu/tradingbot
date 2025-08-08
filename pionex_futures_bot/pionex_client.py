@@ -130,7 +130,14 @@ class PionexClient:
             if r.status_code == 429:
                 return ApiResponse(ok=False, data=None, error="rate_limited")
             r.raise_for_status()
-            return ApiResponse(ok=True, data=r.json(), error=None)
+            data = r.json()
+            if isinstance(data, dict) and data.get("result") is False:
+                # Surface business error as not ok
+                code = data.get("code")
+                message = data.get("message")
+                err = f"{code or ''} {message or ''}".strip()
+                return ApiResponse(ok=False, data=data, error=err or "result_false")
+            return ApiResponse(ok=True, data=data, error=None)
         except Exception as exc:  # noqa: BLE001
             return ApiResponse(ok=False, data=None, error=str(exc))
 
@@ -286,7 +293,22 @@ class PionexClient:
                     time.sleep(sleep_s)
                     continue
                 r.raise_for_status()
-                return ApiResponse(ok=True, data=r.json(), error=None)
+                data = r.json()
+                if isinstance(data, dict) and data.get("result") is False:
+                    code = data.get("code")
+                    message = data.get("message")
+                    err = f"{code or ''} {message or ''}".strip()
+                    return ApiResponse(ok=False, data=data, error=err or "result_false")
+                # Extract the essential identifiers for callers
+                if isinstance(data, dict):
+                    inner = data.get("data") if isinstance(data.get("data"), dict) else None
+                    if isinstance(inner, dict):
+                        slim = {
+                            "orderId": inner.get("orderId"),
+                            "clientOrderId": inner.get("clientOrderId"),
+                        }
+                        return ApiResponse(ok=True, data=slim, error=None)
+                return ApiResponse(ok=True, data=data, error=None)
             except Exception as exc:  # noqa: BLE001
                 return ApiResponse(ok=False, data=None, error=str(exc))
 
