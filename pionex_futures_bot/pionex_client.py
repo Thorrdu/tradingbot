@@ -138,11 +138,11 @@ class PionexClient:
         """Fetch latest price using documented endpoints with fallbacks.
         References: Markets → Get 24hr Ticker, Get Book Ticker, Get Trades
         """
-        # Try both symbol formats: BTCUSDT and BTC_USDT
-        candidate_symbols = [symbol]
-        if "_" not in symbol and symbol.endswith("USDT"):
-            base = symbol[:-4]
-            candidate_symbols.append(f"{base}_USDT")
+        # Prefer documented symbol format BTC_USDT, keep original as fallback
+        normalized = self._normalize_symbol(symbol)
+        candidate_symbols = [normalized]
+        if normalized != symbol:
+            candidate_symbols.append(symbol)
 
         endpoints = [
             {"path": "/api/v1/market/tickers", "kind": "tickers"},
@@ -297,9 +297,23 @@ class PionexClient:
         params: Dict[str, Any] = {"symbol": self._normalize_symbol(symbol)}
         return self._signed_get(path, params)
 
-    def get_fills(self, symbol: str, limit: int = 50) -> ApiResponse:
+    def get_fills(
+        self,
+        symbol: str,
+        start_time_ms: Optional[int] = None,
+        end_time_ms: Optional[int] = None,
+    ) -> ApiResponse:
+        """Get fills for a symbol.
+
+        Compliant with docs: GET /api/v1/trade/fills accepts symbol (required),
+        and optional startTime/endTime in milliseconds. No 'limit' parameter.
+        """
         path = "/api/v1/trade/fills"
-        params: Dict[str, Any] = {"symbol": self._normalize_symbol(symbol), "limit": limit}
+        params: Dict[str, Any] = {"symbol": self._normalize_symbol(symbol)}
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
         return self._signed_get(path, params)
 
     def infer_position_from_fills(self, symbol: str, limit: int = 50) -> Dict[str, Any]:
@@ -309,13 +323,18 @@ class PionexClient:
         """
         out = {"in_position": False, "side": None, "quantity": 0.0, "entry_price": 0.0}
         try:
-            fills_resp = self.get_fills(symbol, limit)
+            # The REST API does not support 'limit' for fills; we can bound by time if desired.
+            # For now, request latest fills without time filters and process client-side.
+            fills_resp = self.get_fills(symbol)
             if not fills_resp.ok or not fills_resp.data:
                 return out
             data = fills_resp.data.get("data") if isinstance(fills_resp.data, dict) else None
             fills = data.get("fills") if isinstance(data, dict) else None
             if not isinstance(fills, list):
                 return out
+            # If a limit was provided by caller, trim locally to the most recent N fills
+            if isinstance(limit, int) and limit > 0 and len(fills) > limit:
+                fills = fills[:limit]
             net_qty = 0.0
             last_price = 0.0
             for f in fills:
