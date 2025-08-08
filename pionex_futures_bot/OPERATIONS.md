@@ -1,12 +1,11 @@
-# Journal d’opérations — Pionex Futures Bot (Windows PowerShell)
+# Journal d’opérations — Pionex Trading Bots (Spot & PERP)
 
 ## Objectif
 Tests prudents en mode dry-run, puis montée progressive. Capital disponible: ~169 USDT. Ne pas engager tout le solde d’un coup.
 
 ## Environnement
-- OS: Windows
-- Shell: PowerShell
-- Python: utiliser `py` pour créer le venv, puis exécuter via `py` et installer via `pip` après activation.
+- OS: Windows (PowerShell) et Debian (Bash)
+- Python: utiliser `py` (Windows) ou `python3` (Debian) pour créer le venv, puis installer via `pip` après activation.
 - Venv: `.venv`
 
 ## Configuration actuelle (réduite pour test)
@@ -17,7 +16,7 @@ Tests prudents en mode dry-run, puis montée progressive. Capital disponible: ~1
 - SL/TP: -2% / +3%
 - Cooldown: 300s
 
-## Procédures PowerShell (simples)
+## Procédures PowerShell (simples) — Spot
 - Créer/activer venv:
   ```powershell
   cd C:\laragon\www\trading\pionex_futures_bot
@@ -58,6 +57,51 @@ Tests prudents en mode dry-run, puis montée progressive. Capital disponible: ~1
   }
   ```
 
+## Procédures PowerShell — PERP (Futures)
+- Lancer le bot (avant‑plan):
+  ```powershell
+  py perp_bot.py
+  ```
+- Lancer en arrière‑plan + logs:
+  ```powershell
+  Start-Job -Name PionexPerp -ScriptBlock {
+    Set-Location 'C:\laragon\www\trading\pionex_futures_bot'
+    . .\.venv\Scripts\Activate.ps1
+    py perp_bot.py *> 'perp_bot.log'
+  }
+  ```
+- Arrêter le bot PERP (job):
+  ```powershell
+  if (Get-Job -Name PionexPerp -ErrorAction SilentlyContinue) {
+    Stop-Job -Name PionexPerp -Force
+    Remove-Job -Name PionexPerp -Force
+  }
+  ```
+
+## Procédures Debian (Bash) — commun Spot & PERP
+- Activer venv et installer:
+  ```bash
+  cd /chemin/vers/pionex_futures_bot
+  python3 -m venv .venv
+  source .venv/bin/activate
+  python -m pip install --upgrade pip
+  pip install -r requirements.txt
+  [ -f .env ] || cp env.example .env
+  ```
+- Démarrer Spot:
+  ```bash
+  python bot.py
+  ```
+- Démarrer PERP:
+  ```bash
+  python perp_bot.py
+  ```
+- Arrière‑plan simple:
+  ```bash
+  nohup bash -lc 'source .venv/bin/activate && python perp_bot.py' > perp_bot.log 2>&1 &
+  disown
+  ```
+
 ## Erreurs fréquentes et corrections
 - Syntaxes Bash (e.g. `| cat`, `<< 'PY'`) → utiliser uniquement des cmdlets PowerShell.
 - Exécuter hors venv → activer d’abord `.\.venv\Scripts\Activate.ps1`, puis utiliser `py`/`pip`.
@@ -71,15 +115,16 @@ Tests prudents en mode dry-run, puis montée progressive. Capital disponible: ~1
 - Création structure, config prudente, simplification des commandes avec `.venv` et utilisation stricte de `py`/`pip`.
 
 ## Robustesse & reprise
-- Persistance locale: `runtime_state.json` conserve l’état minimal par symbole (position ouverte, côté, qty, entry, SL/TP, order_id, last_exit_time).
-- Réconciliation API (best‑effort): au démarrage, si absence d’état local, le bot consulte les fills récents (`GET /api/v1/trade/fills`) pour inférer une position ouverte.
+- Spot: `runtime_state.json` conserve l’état minimal par symbole.
+- PERP: `perp_state.json` conserve l’état minimal par symbole.
+- Réconciliation best‑effort: réutilisation des fills si nécessaire.
 - Limiteur de débit: 10 req/s (IP et compte) avec backoff exponentiel sur 429/5xx.
 - Économie d’appels quand `max_open_trades` atteint: `idle_backoff_sec` pour les symboles sans position.
 
-### Paramètres utiles (`config.json`)
+### Paramètres utiles (Spot `config.json`, PERP `perp_config.json`)
 - `idle_backoff_sec`: backoff quand le symbole n’est pas en position et que la limite globale est atteinte. Défaut: `max(10, 6 * check_interval_sec)`.
 - `log_csv`: fichier de journal des trades.
-- `state_file`: fichier de persistance (défaut: `runtime_state.json`).
+- `state_file`: fichier de persistance.
 
 ### Niveaux de logs
 - Session PowerShell:
@@ -94,6 +139,14 @@ Tests prudents en mode dry-run, puis montée progressive. Capital disponible: ~1
     . .\.venv\Scripts\Activate.ps1
     $env:LOG_LEVEL='DEBUG'
     py bot.py *> 'bot_dryrun.log'
+  }
+  ```
+  ```powershell
+  Start-Job -Name PionexPerp -ScriptBlock {
+    Set-Location 'C:\laragon\www\trading\pionex_futures_bot'
+    . .\.venv\Scripts\Activate.ps1
+    $env:LOG_LEVEL='DEBUG'
+    py perp_bot.py *> 'perp_bot.log'
   }
   ```
 

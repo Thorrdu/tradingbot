@@ -1,8 +1,7 @@
 {
   "base_url": "https://api.pionex.com",
-  "symbols": ["SOLUSDT"],
-  "leverage": 3,
-  "position_usdt": 15,
+  "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+  "position_usdt": 25,
   "max_open_trades": 1,
   "breakout_change_percent": 0.35,
   "stop_loss_percent": 2.0,
@@ -10,7 +9,10 @@
   "check_interval_sec": 3,
   "cooldown_sec": 300,
   "idle_backoff_sec": 15,
-  "dry_run": false,
-  "log_csv": "trades.csv",
-  "state_file": "runtime_state.json"
-} 
+  "dry_run": true,
+  "log_csv": "perp_trades.csv",
+  "state_file": "perp_state.json"
+}
+
+
+

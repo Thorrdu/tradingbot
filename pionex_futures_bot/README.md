@@ -1,4 +1,4 @@
-# Pionex Futures Bot (Breakout Contrarien)
+# Pionex Trading Bots — Spot et PERP (Breakout Contrarien)
 
 Prérequis: Python 3.10+.
 
@@ -22,7 +22,7 @@ Copy-Item pionex_futures_bot\env.example pionex_futures_bot\.env -Force
 
 Par défaut `dry_run` est à `true` pour éviter tout ordre réel.
 
-## Lancer le bot
+## Lancer le bot Spot
 
 ```powershell
 cd C:\laragon\www\trading\pionex_futures_bot
@@ -31,6 +31,16 @@ py bot.py
 
 Les logs de trades seront écrits dans `trades.csv`.
 
+## Lancer le bot PERP (Futures)
+
+```powershell
+cd C:\laragon\www\trading\pionex_futures_bot
+py perp_bot.py
+```
+
+Configuration dédiée: `pionex_futures_bot\perp_config.json` (par défaut `dry_run=true`).
+Le client `perp_client.py` normalise automatiquement les symboles UI (`SOL.PERP_USDT`, `BTCUSDT`, `BTC_USDT`) vers le format API `*_USDT_PERP`.
+
 ## Monitoring (PowerShell)
 
 - État du job
@@ -38,7 +48,7 @@ Les logs de trades seront écrits dans `trades.csv`.
 Get-Job -Name PionexBot | Format-List Name,State,HasMoreData,PSBeginTime,PSEndTime
 ```
 
-- Démarrer en arrière‑plan (avec logs)
+- Démarrer le bot Spot en arrière‑plan (avec logs)
 ```powershell
 cd C:\laragon\www\trading\pionex_futures_bot
 Start-Job -Name PionexBot -ScriptBlock {
@@ -48,10 +58,22 @@ Start-Job -Name PionexBot -ScriptBlock {
 }
 ```
 
-- Arrêter/Nettoyer le job (sans conditionnel)
+- Démarrer le bot PERP en arrière‑plan (avec logs)
+```powershell
+cd C:\laragon\www\trading\pionex_futures_bot
+Start-Job -Name PionexPerp -ScriptBlock {
+  Set-Location 'C:\laragon\www\trading\pionex_futures_bot'
+  . .\.venv\Scripts\Activate.ps1
+  py perp_bot.py *> 'perp_bot.log'
+}
+```
+
+- Arrêter/Nettoyer les jobs (sans conditionnel)
 ```powershell
 Stop-Job -Name PionexBot -Force -ErrorAction SilentlyContinue
 Remove-Job -Name PionexBot -Force -ErrorAction SilentlyContinue
+Stop-Job -Name PionexPerp -Force -ErrorAction SilentlyContinue
+Remove-Job -Name PionexPerp -Force -ErrorAction SilentlyContinue
 ```
 
 - Logs (tail et live)
@@ -59,6 +81,8 @@ Remove-Job -Name PionexBot -Force -ErrorAction SilentlyContinue
 cd C:\laragon\www\trading\pionex_futures_b
 Get-Content .\bot_dryrun.log -Tail 80
 Get-Content .\bot_dryrun.log -Wait -Tail 50
+Get-Content .\perp_bot.log -Tail 80
+Get-Content .\perp_bot.log -Wait -Tail 50
 ```
 
 - Rechercher des erreurs dans le log
@@ -79,7 +103,10 @@ Get-Item .\trades.csv | Select-Object Name,Length,LastWriteTime
   - Activation: `.\.monenv\Scripts\Activate.ps1`
   - Exécution: `py bot.py`
 
-Remarque: Les endpoints utilisés imitent une API de style MBX (signature HMAC-SHA256). Vérifiez les spécifications Pionex réelles et adaptez `pionex_client.py` si nécessaire. 
+Remarques:
+- Les endpoints utilisent une signature HMAC-SHA256.
+- Spot: voir `pionex_client.py`.
+- PERP: voir `perp_client.py` qui envoie les ordres MARKET via `/api/v1/trade/order` avec `symbol=*_USDT_PERP` et `size`.
 
 ## Robustesse & reprise après incident
 
