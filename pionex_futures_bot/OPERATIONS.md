@@ -69,3 +69,50 @@ Tests prudents en mode dry-run, puis montée progressive. Capital disponible: ~1
 
 ## Historique (résumé)
 - Création structure, config prudente, simplification des commandes avec `.venv` et utilisation stricte de `py`/`pip`.
+
+## Robustesse & reprise
+- Persistance locale: `runtime_state.json` conserve l’état minimal par symbole (position ouverte, côté, qty, entry, SL/TP, order_id, last_exit_time).
+- Réconciliation API (best‑effort): au démarrage, si absence d’état local, le bot consulte les fills récents (`GET /api/v1/trade/fills`) pour inférer une position ouverte.
+- Limiteur de débit: 10 req/s (IP et compte) avec backoff exponentiel sur 429/5xx.
+- Économie d’appels quand `max_open_trades` atteint: `idle_backoff_sec` pour les symboles sans position.
+
+### Paramètres utiles (`config.json`)
+- `idle_backoff_sec`: backoff quand le symbole n’est pas en position et que la limite globale est atteinte. Défaut: `max(10, 6 * check_interval_sec)`.
+- `log_csv`: fichier de journal des trades.
+- `state_file`: fichier de persistance (défaut: `runtime_state.json`).
+
+### Niveaux de logs
+- Session PowerShell:
+  ```powershell
+  $env:LOG_LEVEL='DEBUG'
+  py bot.py
+  ```
+- En job:
+  ```powershell
+  Start-Job -Name PionexBot -ScriptBlock {
+    Set-Location 'C:\laragon\www\trading\pionex_futures_bot'
+    . .\.venv\Scripts\Activate.ps1
+    $env:LOG_LEVEL='DEBUG'
+    py bot.py *> 'bot_dryrun.log'
+  }
+  ```
+
+### Monitoring rapide
+- État du job:
+  ```powershell
+  Get-Job -Name PionexBot | Format-List Name,State,HasMoreData,PSBeginTime,PSEndTime
+  ```
+- Logs (tail/live):
+  ```powershell
+  Get-Content .\bot_dryrun.log -Tail 80
+  Get-Content .\bot_dryrun.log -Wait -Tail 50
+  ```
+- Dernières lignes CSV:
+  ```powershell
+  Get-Content .\trades.csv -Tail 10
+  ```
+- Arrêt/nettoyage:
+  ```powershell
+  Stop-Job -Name PionexBot -Force -ErrorAction SilentlyContinue
+  Remove-Job -Name PionexBot -Force -ErrorAction SilentlyContinue
+  ```

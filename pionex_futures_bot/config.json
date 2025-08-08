@@ -1,14 +1,16 @@
 {
   "base_url": "https://api.pionex.com",
-  "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-  "leverage": 5,
-  "position_usdt": 25,
+  "symbols": ["BTCUSDT"],
+  "leverage": 3,
+  "position_usdt": 15,
   "max_open_trades": 1,
   "breakout_change_percent": 0.35,
   "stop_loss_percent": 2.0,
   "take_profit_percent": 3.0,
-  "check_interval_sec": 5,
+  "check_interval_sec": 3,
   "cooldown_sec": 300,
+  "idle_backoff_sec": 15,
   "dry_run": false,
-  "log_csv": "trades.csv"
+  "log_csv": "trades.csv",
+  "state_file": "runtime_state.json"
 } 
