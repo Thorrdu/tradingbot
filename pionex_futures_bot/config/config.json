@@ -1,8 +1,16 @@
 {
   "base_url": "https://api.pionex.com",
-  "symbols": ["SOLUSDT"],
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT"
+  ],
   "leverage": 3,
-  "position_usdt": 15,
+  "position_usdt": 20,
   "max_open_trades": 1,
   "breakout_change_percent": 0.35,
   "stop_loss_percent": 2.0,

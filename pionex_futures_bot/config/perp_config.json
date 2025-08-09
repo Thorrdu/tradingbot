@@ -1,8 +1,16 @@
 {
   "base_url": "https://api.pionex.com",
-  "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-  "position_usdt": 25,
-  "max_open_trades": 1,
+  "symbols": [
+    "BTC.PERP_USDT",
+    "ETH.PERP_USDT",
+    "SOL.PERP_USDT",
+    "BNB.PERP_USDT",
+    "XRP.PERP_USDT",
+    "DOGE.PERP_USDT",
+    "ADA.PERP_USDT"
+  ],
+  "position_usdt": 50,
+  "max_open_trades": 2,
   "breakout_change_percent": 0.35,
   "stop_loss_percent": 2.0,
   "take_profit_percent": 3.0,
