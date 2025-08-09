@@ -151,6 +151,19 @@ class SpotBot:
                     except Exception:
                         pass
                     st.order_id = ps.get("order_id")
+                    # Backfill entry_time if missing for an open position (pre-upgrade state)
+                    if st.in_position and (not isinstance(ps.get("entry_time", None), (int, float)) or st.entry_time <= 0.0):
+                        st.entry_time = time.time()
+                        try:
+                            self.state_store.update_symbol(
+                                sym,
+                                {
+                                    "entry_time": st.entry_time,
+                                },
+                            )
+                            self.log.debug("%s resume: backfilled entry_time", sym)
+                        except Exception:
+                            pass
             # Initialize open trades counter from resumed state
             self._open_trades_count = sum(1 for st in self._states.values() if st.in_position)
             for sym, st in self._states.items():
@@ -539,15 +552,15 @@ class SpotBot:
             state.last_price = price
             exit_reason: Optional[str] = None
             if state.side == "BUY":
-                # Apply hysteresis and min hold
-                if (time.time() - state.entry_time) >= self.min_hold_sec:
+                # Apply hysteresis and min hold using the same 'now' as the rest of the loop
+                elapsed = (now - state.entry_time) if (state.entry_time and state.entry_time > 0.0) else 0.0
+                if elapsed >= self.min_hold_sec:
                     sl_trigger = state.stop_loss * (1.0 - self.exit_hysteresis_percent / 100.0)
                     tp_trigger = state.take_profit * (1.0 + self.exit_hysteresis_percent / 100.0)
                 else:
                     sl_trigger = 0.0  # disable
                     tp_trigger = float("inf")  # disable
                 # Per-tick debug of exit evaluation
-                elapsed = (time.time() - state.entry_time) if (state.entry_time and state.entry_time > 0.0) else 0.0
                 hit_sl_dbg = price <= sl_trigger
                 hit_tp_dbg = price >= tp_trigger
                 self.log.debug(
