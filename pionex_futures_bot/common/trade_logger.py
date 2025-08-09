@@ -68,4 +68,6 @@ class TradeLogger:
                 f,
                 fieldnames=list(row.keys()),
             )
-            writer.writerow(row) 
+            writer.writerow(row)
+
+

@@ -18,10 +18,11 @@ pionex_futures_bot/.env
 # Logs and runtime files
 *.log
 *.pid
-pionex_futures_bot/bot_dryrun.log
+pionex_futures_bot/logs/*
 
 # Data/outputs generated at runtime
-pionex_futures_bot/trades.csv
+nohup.out
+*.tmp
 
 # Build artifacts
 build/

@@ -6,9 +6,8 @@ alwaysApply: true
 
 Always read these files at the start of every new chat session:
 
-- `pionex_futures_bot_setup.md`
-- `pionex_futures_bot/OPERATIONS.md`
-- `pionex_futures_bot/README.md`
+- `README.md`
+- `docs/pionex_futures_bot_setup.md`
 
 Purpose:
 - Ensure the assistant aligns with the project context, goals, constraints, and operational procedures each time.
@@ -16,6 +15,8 @@ Purpose:
 - Prefer short commands and `.venv` as the default virtual environment folder name; adapt paths if a custom name is used.
 
 Additional notes:
-- The project contains two bots: Spot (`bot.py` + `config.json`) and PERP (`perp_bot.py` + `perp_config.json`).
+- The project contains two bots: Spot (`spot/bot.py` + `config/config.json`) and PERP (`perp/bot.py` + `config/perp_config.json`).
+- Unified CLI: `python -m pionex_futures_bot {spot|perp} --config <path>` with `--print-config` available.
+- Logs/CSV/state are stored under `pionex_futures_bot/logs/`.
 - The PERP client normalise les symboles UI (`SOL.PERP_USDT`, `BTCUSDT`, `BTC_USDT`) vers le format API `*_USDT_PERP`.
 - Toujours commencer en `dry_run=true`, puis basculer après validation des logs.

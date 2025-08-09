@@ -139,6 +139,27 @@ if __name__ == "__main__":
 - Trade logging to CSV.
 - Cooldown to prevent rapid-fire entries.
 
+## 9bis. Repository Structure (current)
+
+```
+pionex_futures_bot/
+  common/
+    strategy.py
+    state_store.py
+    trade_logger.py
+  spot/
+    bot.py
+  perp/
+    bot.py
+    client.py
+  pionex_client.py
+  perp_client.py
+  config.json
+  perp_config.json
+  env.example
+  requirements.txt
+```
+
 ---
 
 ## 9. Operating Routine

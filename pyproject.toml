@@ -1,0 +1,31 @@
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = [
+  "E",  # pycodestyle
+  "F",  # pyflakes
+  "I",  # isort
+  "UP", # pyupgrade
+]
+ignore = [
+  "E203",  # slice formatting (black compatible)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pionex_futures_bot"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+no_implicit_optional = true
+warn_return_any = true
+warn_redundant_casts = true
+warn_unreachable = true
+
+

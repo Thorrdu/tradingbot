@@ -6,7 +6,7 @@ import os
 import time
 from typing import Any, Dict, Optional
 
-from pionex_client import PionexClient, ApiResponse
+from .pionex_client import PionexClient, ApiResponse
 
 
 class PerpClient(PionexClient):

@@ -1,24 +1,23 @@
 from __future__ import annotations
 
-import json
 import os
 import threading
 import time
 from dataclasses import dataclass
-import logging
 from pathlib import Path
 from typing import Dict, Optional
+import logging
 
 from dotenv import load_dotenv
 
-from pionex_client import PionexClient
-from strategy import compute_breakout_signal, compute_sl_tp_prices
-from trade_logger import TradeLogger
-from state_store import StateStore
+from pionex_futures_bot.common.trade_logger import TradeLogger
+from pionex_futures_bot.common.state_store import StateStore
+from pionex_futures_bot.common.strategy import compute_breakout_signal, compute_sl_tp_prices
+from pionex_futures_bot.clients import PerpClient
 
 
 @dataclass
-class SymbolState:
+class PerpSymbolState:
     last_price: Optional[float] = None
     in_position: bool = False
     side: Optional[str] = None
@@ -27,12 +26,11 @@ class SymbolState:
     stop_loss: float = 0.0
     take_profit: float = 0.0
     order_id: Optional[str] = None
-    last_exit_time: float = 0.0  # for cooldown
+    last_exit_time: float = 0.0
 
 
-class FuturesBot:
-    def __init__(self, config_path: str = "config.json") -> None:
-        # Configure logging as early as possible
+class PerpBot:
+    def __init__(self, config_path: str = "config/perp_config.json") -> None:
         log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
         level = getattr(logging, log_level_name, logging.INFO)
         logging.basicConfig(
@@ -40,7 +38,9 @@ class FuturesBot:
             format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
-        self.log = logging.getLogger("futures_bot")
+        self.log = logging.getLogger("perp_bot")
+
+        import json
 
         with open(config_path, "r", encoding="utf-8") as f:
             self.config = json.load(f)
@@ -49,35 +49,32 @@ class FuturesBot:
         api_key = os.getenv("API_KEY", "")
         api_secret = os.getenv("API_SECRET", "")
 
-        self.client = PionexClient(
+        self.client = PerpClient(
             api_key=api_key,
             api_secret=api_secret,
             base_url=self.config["base_url"],
             dry_run=bool(self.config.get("dry_run", True)),
         )
 
-        self.symbols = list(self.config["symbols"])  # copy
-        self.leverage = int(self.config["leverage"])
-        self.position_usdt = float(self.config["position_usdt"])  # per-position target notional
+        self.symbols = list(self.config["symbols"])  # symbols like BTCUSDT, normalized to *_PERP
+        self.position_usdt = float(self.config["position_usdt"])  # notional to size contracts
         self.max_open_trades = int(self.config["max_open_trades"])
         self.breakout_change_percent = float(self.config["breakout_change_percent"])
         self.stop_loss_percent = float(self.config["stop_loss_percent"])
         self.take_profit_percent = float(self.config["take_profit_percent"])
         self.check_interval_sec = int(self.config["check_interval_sec"])
-        # Backoff used when this symbol is not in position and max_open_trades is reached
         self.idle_backoff_sec = int(self.config.get("idle_backoff_sec", max(10, self.check_interval_sec * 6)))
         self.cooldown_sec = int(self.config["cooldown_sec"])
 
-        self.logger = TradeLogger(self.config.get("log_csv", "trades.csv"))
-        self.state_store = StateStore(self.config.get("state_file", "runtime_state.json"))
-        self._states: Dict[str, SymbolState] = {s: SymbolState() for s in self.symbols}
+        self.logger = TradeLogger(self.config.get("log_csv", "perp_trades.csv"))
+        self.state_store = StateStore(self.config.get("state_file", "perp_state.json"))
+        self._states: Dict[str, PerpSymbolState] = {s: PerpSymbolState() for s in self.symbols}
         self._open_trades_lock = threading.Lock()
         self._open_trades_count = 0
 
         self.log.info(
-            "Bot initialized | symbols=%s leverage=%s position_usdt=%s max_open_trades=%s interval=%ss cooldown=%ss dry_run=%s",
+            "PerpBot initialized | symbols=%s position_usdt=%s max_open_trades=%s interval=%ss cooldown=%ss dry_run=%s",
             ",".join(self.symbols),
-            self.leverage,
             self.position_usdt,
             self.max_open_trades,
             self.check_interval_sec,
@@ -99,51 +96,14 @@ class FuturesBot:
                 self._open_trades_count -= 1
 
     def _round_quantity(self, quantity: float) -> float:
-        # Conservative rounding to 6 decimals to avoid over-size; adjust per symbol if needed
         return max(round(quantity, 6), 0.0)
 
     def _worker(self, symbol: str) -> None:
         state = self._states[symbol]
-        thread_name = f"{symbol}-worker"
-        threading.current_thread().name = thread_name
+        threading.current_thread().name = f"{symbol}-perp"
         self.log.info("Worker started for %s", symbol)
 
-        # Attempt resume from persisted state
-        persisted = self.state_store.load().get(symbol)
-        if persisted and isinstance(persisted, dict):
-            try:
-                state.in_position = bool(persisted.get("in_position", False))
-                state.side = persisted.get("side")
-                state.quantity = float(persisted.get("quantity", 0.0))
-                state.entry_price = float(persisted.get("entry_price", 0.0))
-                state.stop_loss = float(persisted.get("stop_loss", 0.0))
-                state.take_profit = float(persisted.get("take_profit", 0.0))
-                state.order_id = persisted.get("order_id")
-                state.last_exit_time = float(persisted.get("last_exit_time", 0.0))
-                self.log.info("%s resume: in_position=%s side=%s qty=%.6f entry=%.8f", symbol, state.in_position, state.side, state.quantity, state.entry_price)
-                if state.in_position:
-                    with self._open_trades_lock:
-                        self._open_trades_count = min(self._open_trades_count + 1, self.max_open_trades)
-            except Exception:
-                pass
-
-        # If no persisted position, try to infer from recent fills (best-effort)
-        if not state.in_position:
-            inferred = self.client.infer_position_from_fills(symbol)
-            if inferred.get("in_position"):
-                state.in_position = True
-                state.side = inferred.get("side")
-                state.quantity = float(inferred.get("quantity", 0.0))
-                state.entry_price = float(inferred.get("entry_price", 0.0))
-                self.log.info(
-                    "%s inferred position from fills: side=%s qty=%.6f entry=%.8f",
-                    symbol,
-                    state.side,
-                    state.quantity,
-                    state.entry_price,
-                )
-
-        # Initialize last price
+        # Initialize price
         while state.last_price is None:
             resp = self.client.get_price(symbol)
             if resp.ok and resp.data and "price" in resp.data:
@@ -153,15 +113,11 @@ class FuturesBot:
                 self.log.warning("%s price init failed: %s", symbol, getattr(resp, "error", None))
                 time.sleep(1)
 
-        # Heartbeat cadence based on check interval (~60s)
         tick = 0
         heartbeat_every = max(1, int(60 / max(1, self.check_interval_sec)))
 
-        # Main loop
         while True:
-            # Throttle symbols that cannot enter because global max is reached
             if (not state.in_position) and (not self._can_open_more()):
-                # Log a heartbeat less frequently, then back off without hitting the API
                 if tick % heartbeat_every == 0:
                     self.log.info("%s heartbeat: max_open_trades reached, skipping price fetch for %ss", symbol, self.idle_backoff_sec)
                 time.sleep(self.idle_backoff_sec)
@@ -179,7 +135,6 @@ class FuturesBot:
             now = time.time()
 
             if not state.in_position:
-                # cooldown check
                 if state.last_exit_time and (now - state.last_exit_time) < self.cooldown_sec:
                     state.last_price = price
                     if tick % heartbeat_every == 0:
@@ -202,37 +157,17 @@ class FuturesBot:
                     breakout_change_percent=self.breakout_change_percent,
                 )
                 change_pct = (price - state.last_price) / state.last_price * 100.0
-                self.log.debug(
-                    "%s delta=%.4f%% last=%.8f cur=%.8f sig=%s",
-                    symbol,
-                    change_pct,
-                    state.last_price,
-                    price,
-                    sig,
-                )
+                self.log.debug("%s delta=%.4f%% last=%.8f cur=%.8f sig=%s", symbol, change_pct, state.last_price, price, sig)
                 if sig.should_enter and sig.side:
-                    # position sizing
                     quantity = self._round_quantity(self.position_usdt / price)
                     if quantity <= 0:
-                        self.log.warning("%s quantity computed <= 0; skipping entry", symbol)
                         state.last_price = price
                         time.sleep(self.check_interval_sec)
                         tick += 1
                         continue
 
                     self.log.info("%s ENTRY signal side=%s qty=%.6f price=%.8f", symbol, sig.side, quantity, price)
-                    if sig.side == "BUY":
-                        order = self.client.place_market_order(
-                            symbol=symbol,
-                            side=sig.side,
-                            amount=self.position_usdt,
-                        )
-                    else:
-                        order = self.client.place_market_order(
-                            symbol=symbol,
-                            side=sig.side,
-                            quantity=quantity,
-                        )
+                    order = self.client.place_market_order(symbol=symbol, side=sig.side, quantity=quantity)
                     if order.ok:
                         entry_price = price
                         sl, tp = compute_sl_tp_prices(
@@ -247,11 +182,8 @@ class FuturesBot:
                         state.entry_price = entry_price
                         state.stop_loss = sl
                         state.take_profit = tp
-                        state.order_id = (
-                            str(order.data.get("orderId")) if order.data else None  # type: ignore[union-attr]
-                        )
+                        state.order_id = str(order.data.get("orderId")) if order.data else None  # type: ignore[union-attr]
                         self._on_open()
-                        # Persist state for resume
                         self.state_store.update_symbol(
                             symbol,
                             {
@@ -275,19 +207,12 @@ class FuturesBot:
                             take_profit=tp,
                             order_id=state.order_id,
                             reason="breakout",
-                            meta={"leverage": self.leverage},
+                            meta={"market": "PERP"},
                         )
-                        self.log.info(
-                            "%s ENTRY ok order_id=%s sl=%.8f tp=%.8f", symbol, state.order_id, sl, tp
-                        )
+                        self.log.info("%s ENTRY ok order_id=%s sl=%.8f tp=%.8f", symbol, state.order_id, sl, tp)
                     else:
                         self.log.error("%s ENTRY failed: %s", symbol, order.error)
-                        self.logger.log(
-                            event="error",
-                            symbol=symbol,
-                            reason=f"order_failed: {order.error}",
-                        )
-                # update last price for next delta calc
+                        self.logger.log(event="error", symbol=symbol, reason=f"order_failed: {order.error}")
                 state.last_price = price
                 time.sleep(self.check_interval_sec)
                 tick += 1
@@ -295,26 +220,11 @@ class FuturesBot:
 
             # Manage open position
             if state.in_position and state.side:
-                if state.side == "BUY":
-                    hit_sl = price <= state.stop_loss
-                    hit_tp = price >= state.take_profit
-                else:  # SELL
-                    hit_sl = price >= state.stop_loss
-                    hit_tp = price <= state.take_profit
-
+                hit_sl = price <= state.stop_loss if state.side == "BUY" else price >= state.stop_loss
+                hit_tp = price >= state.take_profit if state.side == "BUY" else price <= state.take_profit
                 if hit_sl or hit_tp:
-                    self.log.info(
-                        "%s EXIT trigger side=%s price=%.8f reason=%s",
-                        symbol,
-                        state.side,
-                        price,
-                        "take_profit" if hit_tp else "stop_loss",
-                    )
-                    close_resp = self.client.close_position(
-                        symbol=symbol,
-                        side=state.side,
-                        quantity=state.quantity,
-                    )
+                    self.log.info("%s EXIT trigger side=%s price=%.8f reason=%s", symbol, state.side, price, "take_profit" if hit_tp else "stop_loss")
+                    close_resp = self.client.place_market_order(symbol=symbol, side=("SELL" if state.side == "BUY" else "BUY"), quantity=state.quantity)
                     if close_resp.ok:
                         pnl = (price - state.entry_price) * state.quantity
                         if state.side == "SELL":
@@ -332,12 +242,7 @@ class FuturesBot:
                         self.log.info("%s EXIT ok pnl=%.6f", symbol, pnl)
                     else:
                         self.log.error("%s EXIT failed: %s", symbol, close_resp.error)
-                        self.logger.log(
-                            event="error",
-                            symbol=symbol,
-                            reason=f"close_failed: {close_resp.error}",
-                        )
-                    # reset state regardless; avoid stuck positions in dry-run
+                        self.logger.log(event="error", symbol=symbol, reason=f"close_failed: {close_resp.error}")
                     state.in_position = False
                     state.side = None
                     state.quantity = 0.0
@@ -347,10 +252,8 @@ class FuturesBot:
                     state.order_id = None
                     state.last_exit_time = time.time()
                     self._on_close()
-                    # Clear persisted state
                     self.state_store.clear_symbol(symbol)
                 else:
-                    # Position heartbeat for visibility
                     if tick % heartbeat_every == 0:
                         self.log.info(
                             "%s position heartbeat side=%s entry=%.8f sl=%.8f tp=%.8f price=%.8f qty=%.6f",
@@ -362,7 +265,6 @@ class FuturesBot:
                             price,
                             state.quantity,
                         )
-                # always refresh last price
                 state.last_price = price
                 time.sleep(self.check_interval_sec)
                 tick += 1
@@ -374,17 +276,18 @@ class FuturesBot:
             t = threading.Thread(target=self._worker, args=(symbol,), daemon=True)
             t.start()
             threads.append(t)
-        self.log.info("Bot running with %d worker(s)", len(threads))
-        # keep main thread alive
+        self.log.info("PerpBot running with %d worker(s)", len(threads))
         try:
             while True:
                 time.sleep(60)
         except KeyboardInterrupt:
-            self.log.info("Stopping bot...")
+            self.log.info("Stopping PerpBot...")
 
 
 if __name__ == "__main__":
-    project_dir = Path(__file__).resolve().parent
+    project_dir = Path(__file__).resolve().parent.parent
     os.chdir(project_dir)
-    bot = FuturesBot()
-    bot.run() 
+    bot = PerpBot()
+    bot.run()
+
+

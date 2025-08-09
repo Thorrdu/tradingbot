@@ -20,7 +20,7 @@ def compute_breakout_signal(
     breakout_change_percent: float,
 ) -> Signal:
     change_pct = (current_price - last_price) / last_price * 100.0
-    # Contrarian logic from the example: dump -> BUY, pump -> SELL
+    # Contrarian logic: dump -> BUY, pump -> SELL
     if change_pct <= -breakout_change_percent:
         return Signal(should_enter=True, side="BUY")
     if change_pct >= breakout_change_percent:
@@ -41,4 +41,6 @@ def compute_sl_tp_prices(
     else:  # SELL
         sl = entry_price * (1.0 + stop_loss_percent / 100.0)
         tp = entry_price * (1.0 - take_profit_percent / 100.0)
-    return (sl, tp) 
+    return (sl, tp)
+
+
