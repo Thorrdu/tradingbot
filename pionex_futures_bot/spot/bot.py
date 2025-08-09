@@ -168,6 +168,16 @@ class SpotBot:
             self.cooldown_sec,
             bool(self.config.get("dry_run", True)),
         )
+        self.log.info(
+            "SpotBot params | breakout=±%.2f%% lookback=%ss confirm_ticks=%d min_hold=%ss hysteresis=%.2f%% force_min_sell=%s caps: per_symbol=%d",
+            self.breakout_change_percent,
+            self.breakout_lookback_sec,
+            self.breakout_confirm_ticks,
+            self.min_hold_sec,
+            self.exit_hysteresis_percent,
+            self.force_min_sell,
+            self.max_open_trades_per_symbol,
+        )
 
     def _can_open_more(self) -> bool:
         with self._open_trades_lock:
@@ -497,6 +507,16 @@ class SpotBot:
                                 "last_exit_time": state.last_exit_time,
                             },
                         )
+                        self.log.info(
+                            "%s ENTRY set: entry=%.8f qty=%.6f sl=%.8f tp=%.8f min_hold=%ss hysteresis=%.2f%%",
+                            symbol,
+                            state.entry_price,
+                            state.quantity,
+                            state.stop_loss,
+                            state.take_profit,
+                            self.min_hold_sec,
+                            self.exit_hysteresis_percent,
+                        )
                         self.logger.log(
                             event="ENTRY",
                             symbol=symbol,
@@ -524,6 +544,24 @@ class SpotBot:
                 else:
                     sl_trigger = 0.0  # disable
                     tp_trigger = float("inf")  # disable
+                # Per-tick debug of exit evaluation
+                elapsed = time.time() - (state.entry_time or 0.0)
+                hit_sl_dbg = price <= sl_trigger
+                hit_tp_dbg = price >= tp_trigger
+                self.log.debug(
+                    "%s open: price=%.8f entry=%.8f sl=%.8f tp=%.8f sl_trig=%.8f tp_trig=%.8f hold=%.1fs/%ss hit_sl=%s hit_tp=%s",
+                    symbol,
+                    price,
+                    state.entry_price,
+                    state.stop_loss,
+                    state.take_profit,
+                    sl_trigger,
+                    tp_trigger,
+                    elapsed,
+                    self.min_hold_sec,
+                    hit_sl_dbg,
+                    hit_tp_dbg,
+                )
                 if price <= sl_trigger:
                     exit_reason = "SL"
                 elif price >= tp_trigger:
@@ -559,12 +597,23 @@ class SpotBot:
             if exit_reason is not None:
                 self.log.info("%s EXIT trigger: reason=%s price=%.8f side=%s", symbol, exit_reason, price, state.side)
                 free_bal = self._get_free_base_balance(symbol)
+                step, min_dump, max_dump = self._parse_spot_rules(symbol)
                 sell_qty = self._normalize_spot_sell_quantity(symbol, state.quantity, free_balance=free_bal, force_min_if_possible=self.force_min_sell)
                 if sell_qty <= 0:
                     self.log.error("%s EXIT %s skipped: qty below rules or balance (qty=%.8f free=%.8f)", symbol, exit_reason, state.quantity, free_bal)
                     time.sleep(self.check_interval_sec)
                     tick += 1
                     continue
+                self.log.debug(
+                    "%s EXIT normalize: req_qty=%.8f free=%.8f -> sell_qty=%.8f step=%.g min=%.8f max=%s",
+                    symbol,
+                    state.quantity,
+                    free_bal,
+                    sell_qty,
+                    step,
+                    min_dump,
+                    ("%.8f" % max_dump) if (max_dump is not None) else "None",
+                )
                 close_resp = self.client.close_position(symbol=symbol, side=state.side or "BUY", quantity=sell_qty)
                 if not close_resp.ok:
                     self.log.error("%s EXIT %s failed: %s", symbol, exit_reason, close_resp.error)

@@ -222,7 +222,7 @@ class PerpBot:
                 should_enter = provisional_side is not None and state.confirm_streak >= self.breakout_confirm_ticks
                 # Detailed per-tick diagnostics (visible with LOG_LEVEL=DEBUG)
                 self.log.debug(
-                    "%s price=%.8f ref=%.8f delta=%.4f%% thresh=±%.2f%% lookback=%ss streak=%d side=%s",
+                    "%s tick: price=%.8f ref=%.8f delta=%.4f%% thresh=±%.2f%% lookback=%ss streak=%d side=%s",
                     symbol,
                     price,
                     float(old_price),
