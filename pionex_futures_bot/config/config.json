@@ -12,7 +12,7 @@
   "leverage": 3,
   "position_usdt": 20,
   "max_open_trades": 1,
-  "breakout_change_percent": 0.35,
+  "breakout_change_percent": 0.25,
   "stop_loss_percent": 2.0,
   "take_profit_percent": 3.0,
   "check_interval_sec": 3,
