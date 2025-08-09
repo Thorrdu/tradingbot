@@ -317,6 +317,7 @@ class SpotBot:
                         continue
             except Exception:
                 pass
+            resumed_count = 0
             for sym, st in self._states.items():
                 ps = persisted.get(sym, {}) if isinstance(persisted, dict) else {}
                 if (not ps) and alt_states:
@@ -351,6 +352,13 @@ class SpotBot:
                             self.log.debug("%s resume: backfilled entry_time", sym)
                         except Exception:
                             pass
+                    if st.in_position:
+                        resumed_count += 1
+            # Startup resume summary
+            try:
+                self.log.info("State resume | primary=%s resumed=%d symbols", self.config.get("state_file", "logs/runtime_state.json"), resumed_count)
+            except Exception:
+                pass
             # Initialize open trades counter from resumed state
             self._open_trades_count = sum(1 for st in self._states.values() if st.in_position)
             for sym, st in self._states.items():
