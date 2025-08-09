@@ -6,7 +6,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Deque, Tuple
+from typing import Dict, Optional, Deque, Tuple, Any
 from collections import deque
 import logging
 
@@ -96,6 +96,39 @@ class SpotBot:
         history_len = max(300, int(max(1, self.breakout_lookback_sec) / max(1, self.check_interval_sec)) * 5)
         self._price_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=history_len) for s in self.symbols}
 
+        # Load SPOT symbol trading rules (precision/min dump) from cache or API
+        self._spot_rules: Dict[str, Dict[str, Any]] = {}
+        try:
+            from pathlib import Path as _P
+            import json as _J
+            cache_paths = [
+                _P("config/symbols_spot.json"),
+                _P("config/symbols.json"),
+            ]
+            loaded = False
+            for p in cache_paths:
+                if p.exists():
+                    blob = _J.loads(p.read_text(encoding="utf-8"))
+                    arr = blob.get("symbols", []) if isinstance(blob, dict) else []
+                    if isinstance(arr, list):
+                        for item in arr:
+                            if not isinstance(item, dict):
+                                continue
+                            sym = str(item.get("symbol", "")).upper()
+                            if sym:
+                                self._spot_rules[sym] = item
+                        loaded = True
+                        break
+            if not loaded:
+                # On-demand fetch only for configured symbols (keeps it light)
+                resp = self.client.get_market_symbols(market_type="SPOT", symbols=[self.client._normalize_symbol(s) for s in self.symbols])
+                if resp.ok and resp.data and isinstance(resp.data.get("symbols"), list):
+                    for item in resp.data["symbols"]:
+                        if isinstance(item, dict) and item.get("symbol"):
+                            self._spot_rules[str(item["symbol"]).upper()] = item
+        except Exception as _e:
+            self.log.debug("Failed to load SPOT rules: %s", _e)
+
         # Resume state from previous run if available
         try:
             persisted = self.state_store.load()
@@ -171,6 +204,28 @@ class SpotBot:
 
     def _round_quantity(self, quantity: float) -> float:
         return max(round(quantity, 6), 0.0)
+
+    def _normalize_spot_sell_quantity(self, symbol: str, quantity: float) -> float:
+        """Normalize sell size to exchange filters for SPOT market.
+
+        Uses amountPrecision (decimal places) and minTradeDumping (min market sell qty).
+        Falls back to 6 decimals if not available.
+        """
+        try:
+            norm = self.client._normalize_symbol(symbol)
+            rules = self._spot_rules.get(norm) or {}
+            amount_precision = int(rules.get("amountPrecision", 6))
+            min_dump = float(rules.get("minTradeDumping", 0.0)) if rules.get("minTradeDumping") is not None else 0.0
+            step = 10 ** (-amount_precision)
+            # floor to step
+            floored = (int(quantity / step)) * step
+            floored = round(floored, amount_precision)
+            if floored < min_dump:
+                return 0.0
+            return max(floored, 0.0)
+        except Exception:
+            q = self._round_quantity(quantity)
+            return q if q > 0 else 0.0
 
     def _worker(self, symbol: str) -> None:
         state = self._states[symbol]
@@ -411,7 +466,13 @@ class SpotBot:
 
             if exit_reason is not None:
                 self.log.info("%s EXIT trigger: reason=%s price=%.8f side=%s", symbol, exit_reason, price, state.side)
-                close_resp = self.client.close_position(symbol=symbol, side=state.side or "BUY", quantity=self._round_quantity(state.quantity))
+                sell_qty = self._normalize_spot_sell_quantity(symbol, state.quantity)
+                if sell_qty <= 0:
+                    self.log.error("%s EXIT %s skipped: size below minTradeDumping or precision step (qty=%.8f)", symbol, exit_reason, state.quantity)
+                    time.sleep(self.check_interval_sec)
+                    tick += 1
+                    continue
+                close_resp = self.client.close_position(symbol=symbol, side=state.side or "BUY", quantity=sell_qty)
                 if not close_resp.ok:
                     self.log.error("%s EXIT %s failed: %s", symbol, exit_reason, close_resp.error)
                 else:
