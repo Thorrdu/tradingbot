@@ -147,6 +147,7 @@ class SpotBot:
                         st.stop_loss = float(ps.get("stop_loss", 0.0))
                         st.take_profit = float(ps.get("take_profit", 0.0))
                         st.last_exit_time = float(ps.get("last_exit_time", 0.0))
+                        st.entry_time = float(ps.get("entry_time", 0.0))
                     except Exception:
                         pass
                     st.order_id = ps.get("order_id")
@@ -505,6 +506,7 @@ class SpotBot:
                                 "take_profit": state.take_profit,
                                 "order_id": state.order_id,
                                 "last_exit_time": state.last_exit_time,
+                                "entry_time": state.entry_time,
                             },
                         )
                         self.log.info(
@@ -545,7 +547,7 @@ class SpotBot:
                     sl_trigger = 0.0  # disable
                     tp_trigger = float("inf")  # disable
                 # Per-tick debug of exit evaluation
-                elapsed = time.time() - (state.entry_time or 0.0)
+                elapsed = (time.time() - state.entry_time) if (state.entry_time and state.entry_time > 0.0) else 0.0
                 hit_sl_dbg = price <= sl_trigger
                 hit_tp_dbg = price >= tp_trigger
                 self.log.debug(
@@ -646,6 +648,7 @@ class SpotBot:
                     state.take_profit = 0.0
                     state.order_id = None
                     state.last_exit_time = time.time()
+                    state.entry_time = 0.0
                     self._on_close()
                     self._release_symbol_slot(symbol)
                     self.state_store.clear_symbol(symbol)
