@@ -60,6 +60,19 @@ class SpotBot:
         )
 
         self.symbols = list(self.config["symbols"])  # copy
+        # Optional: validate symbols against cached list if present
+        try:
+            from pathlib import Path as _P
+            import json as _J
+            sym_cache = _P("config/symbols.json")
+            if sym_cache.exists():
+                cache = _J.loads(sym_cache.read_text(encoding="utf-8"))
+                cache_syms = {str(s.get("symbol", "")).upper() for s in cache.get("symbols", []) if isinstance(s, dict)}
+                bad = [s for s in self.symbols if self.client._normalize_symbol(s) not in cache_syms]
+                if bad:
+                    self.log.warning("Some SPOT symbols may be invalid vs cache: %s", ",".join(bad))
+        except Exception:
+            pass
         self.leverage = int(self.config.get("leverage", 1))
         self.position_usdt = float(self.config["position_usdt"])  # per-position target notional
         self.max_open_trades = int(self.config["max_open_trades"])
@@ -191,6 +204,19 @@ class SpotBot:
                     else:
                         state.last_signal_side = provisional_side
                         state.confirm_streak = 1
+
+                # Detailed per-tick diagnostics (visible with LOG_LEVEL=DEBUG)
+                self.log.debug(
+                    "%s price=%.8f ref=%.8f delta=%.4f%% thresh=±%.2f%% lookback=%ss streak=%d side=%s",
+                    symbol,
+                    price,
+                    float(old_price),
+                    change_pct,
+                    self.breakout_change_percent,
+                    self.breakout_lookback_sec,
+                    state.confirm_streak,
+                    provisional_side,
+                )
 
                 should_enter = provisional_side is not None and state.confirm_streak >= self.breakout_confirm_ticks
                 if should_enter and provisional_side:

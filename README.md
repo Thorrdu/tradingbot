@@ -32,6 +32,30 @@ cd ..
 python -m pionex_futures_bot spot --config ./pionex_futures_bot/config/config.json
 ```
 
+### Logging / Debug
+
+- Windows PowerShell (session courante):
+```powershell
+$env:LOG_LEVEL = "DEBUG"
+py -m pionex_futures_bot spot --config .\pionex_futures_bot\config\config.json
+# ou PERP
+$env:LOG_LEVEL = "DEBUG"; py -m pionex_futures_bot perp --config .\pionex_futures_bot\config\perp_config.json
+```
+
+- Debian Bash (session courante):
+```bash
+export LOG_LEVEL=DEBUG
+python -m pionex_futures_bot spot --config ./pionex_futures_bot/config/config.json
+# ou PERP
+export LOG_LEVEL=DEBUG; python -m pionex_futures_bot perp --config ./pionex_futures_bot/config/perp_config.json
+```
+
+- Via fichier `.env` (persistant): éditez `pionex_futures_bot/.env` et ajoutez:
+```
+LOG_LEVEL=DEBUG
+```
+Les scripts `run.ps1` et `run.sh` chargent l’environnement et écrivent les logs dans `pionex_futures_bot/logs/`.
+
 ## Getting Started
 
 ### 1) Install (Windows PowerShell)

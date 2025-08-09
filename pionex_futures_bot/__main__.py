@@ -67,6 +67,10 @@ def main() -> None:
     p_perp.add_argument("--config", default="config/perp_config.json", help="Chemin du fichier de configuration PERP")
     p_perp.add_argument("--print-config", action="store_true", help="Affiche un exemple de configuration et sort")
 
+    p_utils = sub.add_parser("symbols", help="Fetch and store market symbols (SPOT/PERP)")
+    p_utils.add_argument("--type", choices=["SPOT", "PERP"], help="Market type to fetch")
+    p_utils.add_argument("--out", default="config/symbols.json", help="Output JSON path")
+
     args = parser.parse_args()
 
     if args.cmd == "spot":
@@ -79,6 +83,23 @@ def main() -> None:
             _print_config_example("perp")
             return
         _run_perp(args.config)
+    elif args.cmd == "symbols":
+        from pionex_futures_bot.clients import PionexClient
+        _chdir_to_project_root()
+        client = PionexClient(api_key="", api_secret="", base_url=os.getenv("PIONEX_BASE_URL", "https://api.pionex.com"), dry_run=True)
+        resp = client.get_market_symbols(market_type=args.type)
+        if not resp.ok or not resp.data or not isinstance(resp.data.get("symbols"), list):
+            print("Failed to fetch symbols:", resp.error)
+            return
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out = {
+            "type": args.type or "ALL",
+            "fetched_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+            "symbols": resp.data["symbols"],
+        }
+        out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
+        print(f"Saved {len(resp.data['symbols'])} symbols to {out_path}")
     else:
         parser.print_help()
 

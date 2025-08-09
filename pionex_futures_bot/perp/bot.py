@@ -50,8 +50,9 @@ class PerpBot:
             self.config = json.load(f)
 
         load_dotenv(override=False)
-        api_key = os.getenv("API_KEY", "")
-        api_secret = os.getenv("API_SECRET", "")
+        # Prefer dedicated PERP credentials if provided, fallback to generic
+        api_key = os.getenv("PERP_API_KEY", os.getenv("API_KEY", ""))
+        api_secret = os.getenv("PERP_API_SECRET", os.getenv("API_SECRET", ""))
 
         self.client = PerpClient(
             api_key=api_key,
@@ -61,6 +62,19 @@ class PerpBot:
         )
 
         self.symbols = list(self.config["symbols"])  # symbols like BTCUSDT, normalized to *_PERP
+        # Optional: validate symbols against cached list if present
+        try:
+            from pathlib import Path as _P
+            import json as _J
+            sym_cache = _P("config/symbols.json")
+            if sym_cache.exists():
+                cache = _J.loads(sym_cache.read_text(encoding="utf-8"))
+                cache_syms = {str(s.get("symbol", "")).upper() for s in cache.get("symbols", []) if isinstance(s, dict)}
+                bad = [s for s in self.symbols if self.client._normalize_symbol(s) not in cache_syms]
+                if bad:
+                    self.log.warning("Some PERP symbols may be invalid vs cache: %s", ",".join(bad))
+        except Exception:
+            pass
         self.position_usdt = float(self.config["position_usdt"])  # notional to size contracts
         self.max_open_trades = int(self.config["max_open_trades"])
         self.breakout_change_percent = float(self.config["breakout_change_percent"])
@@ -90,6 +104,20 @@ class PerpBot:
             self.cooldown_sec,
             bool(self.config.get("dry_run", True)),
         )
+
+        # Validate configured PERP symbols against API to catch mismatches early
+        try:
+            normalized = [self.client._normalize_symbol(s) for s in self.symbols]
+            resp = self.client.get_market_symbols(market_type="PERP", symbols=normalized)
+            if not resp.ok or not resp.data:
+                self.log.warning("PERP symbol validation skipped (api error): %s", getattr(resp, "error", None))
+            else:
+                api_syms = {str(s.get("symbol", "")).upper() for s in resp.data.get("symbols", []) if isinstance(s, dict)}
+                bad = [s for s in normalized if s not in api_syms]
+                if bad:
+                    self.log.error("Invalid PERP symbols (not found in API): %s", ",".join(bad))
+        except Exception as _exc:
+            self.log.debug("PERP symbol validation error: %s", _exc)
 
     def _can_open_more(self) -> bool:
         with self._open_trades_lock:
@@ -192,10 +220,14 @@ class PerpBot:
                         state.confirm_streak = 1
 
                 should_enter = provisional_side is not None and state.confirm_streak >= self.breakout_confirm_ticks
+                # Detailed per-tick diagnostics (visible with LOG_LEVEL=DEBUG)
                 self.log.debug(
-                    "%s delta=%.4f%% lookback=%ss streak=%d side=%s",
+                    "%s price=%.8f ref=%.8f delta=%.4f%% thresh=±%.2f%% lookback=%ss streak=%d side=%s",
                     symbol,
+                    price,
+                    float(old_price),
                     change_pct,
+                    self.breakout_change_percent,
                     self.breakout_lookback_sec,
                     state.confirm_streak,
                     provisional_side,

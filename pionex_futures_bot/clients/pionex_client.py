@@ -212,6 +212,38 @@ class PionexClient:
         self.log.error("get_price failed for %s: %s", symbol, last_error)
         return ApiResponse(ok=False, data=None, error=last_error or "unknown_error")
 
+    def get_market_symbols(self, market_type: str | None = None, symbols: list[str] | None = None) -> ApiResponse:
+        """Fetch market symbols from Common → Market Data.
+
+        Docs: GET /api/v1/common/symbols
+        - market_type: "SPOT" or "PERP" (optional)
+        - symbols: list of specific symbols to query (optional)
+        Returns ApiResponse with { data: { symbols: [...] } } or a simplified list under data["symbols"] on success.
+        """
+        try:
+            self.rate_limiter.wait("ip", weight=5)
+            url = f"{self.base_url}/api/v1/common/symbols"
+            params: Dict[str, Any] = {}
+            if market_type:
+                params["type"] = market_type.upper()
+            if symbols:
+                params["symbols"] = ",".join(symbols)
+            r = self.session.get(url, params=params, timeout=self.timeout_sec)
+            if r.status_code != 200:
+                return ApiResponse(ok=False, data=None, error=f"HTTP {r.status_code}: {r.text[:200]}")
+            data = r.json()
+            # Normalize payload to a list of dicts with a 'symbol' key
+            arr = None
+            if isinstance(data, dict):
+                inner = data.get("data") if isinstance(data.get("data"), dict) else data
+                if isinstance(inner, dict) and isinstance(inner.get("symbols"), list):
+                    arr = inner.get("symbols")
+            if not isinstance(arr, list):
+                return ApiResponse(ok=False, data=None, error="unexpected_response")
+            return ApiResponse(ok=True, data={"symbols": arr}, error=None)
+        except Exception as exc:  # noqa: BLE001
+            return ApiResponse(ok=False, data=None, error=str(exc))
+
     def _normalize_symbol(self, symbol: str) -> str:
         if "_" in symbol:
             return symbol
