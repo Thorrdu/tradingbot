@@ -5,7 +5,8 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Deque, Tuple
+from collections import deque
 import logging
 
 from dotenv import load_dotenv
@@ -27,6 +28,9 @@ class PerpSymbolState:
     take_profit: float = 0.0
     order_id: Optional[str] = None
     last_exit_time: float = 0.0
+    # Signal confirmation helpers (not persisted):
+    confirm_streak: int = 0
+    last_signal_side: Optional[str] = None
 
 
 class PerpBot:
@@ -60,6 +64,8 @@ class PerpBot:
         self.position_usdt = float(self.config["position_usdt"])  # notional to size contracts
         self.max_open_trades = int(self.config["max_open_trades"])
         self.breakout_change_percent = float(self.config["breakout_change_percent"])
+        self.breakout_lookback_sec = int(self.config.get("breakout_lookback_sec", 60))
+        self.breakout_confirm_ticks = int(self.config.get("breakout_confirm_ticks", 2))
         self.stop_loss_percent = float(self.config["stop_loss_percent"])
         self.take_profit_percent = float(self.config["take_profit_percent"])
         self.check_interval_sec = int(self.config["check_interval_sec"])
@@ -71,6 +77,9 @@ class PerpBot:
         self._states: Dict[str, PerpSymbolState] = {s: PerpSymbolState() for s in self.symbols}
         self._open_trades_lock = threading.Lock()
         self._open_trades_count = 0
+        # Per-symbol price history for lookback computations
+        history_len = max(300, int(max(1, self.breakout_lookback_sec) / max(1, self.check_interval_sec)) * 5)
+        self._price_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=history_len) for s in self.symbols}
 
         self.log.info(
             "PerpBot initialized | symbols=%s position_usdt=%s max_open_trades=%s interval=%ss cooldown=%ss dry_run=%s",
@@ -151,14 +160,47 @@ class PerpBot:
                     tick += 1
                     continue
 
-                sig = compute_breakout_signal(
-                    last_price=state.last_price,
-                    current_price=price,
-                    breakout_change_percent=self.breakout_change_percent,
+                # Maintain price history and compute lookback delta
+                hist = self._price_history[symbol]
+                hist.append((now, price))
+                threshold_time = now - self.breakout_lookback_sec
+                old_price: Optional[float] = None
+                for ts, px in reversed(hist):
+                    if ts <= threshold_time:
+                        old_price = px
+                        break
+                if old_price is None:
+                    old_price = state.last_price if state.last_price is not None else price
+                change_pct = (price - float(old_price)) / float(old_price) * 100.0
+
+                # Contrarian breakout side based on lookback
+                provisional_side: Optional[str] = None
+                if change_pct <= -self.breakout_change_percent:
+                    provisional_side = "BUY"
+                elif change_pct >= self.breakout_change_percent:
+                    provisional_side = "SELL"
+
+                # Confirmation over N ticks
+                if provisional_side is None:
+                    state.confirm_streak = 0
+                    state.last_signal_side = None
+                else:
+                    if state.last_signal_side == provisional_side:
+                        state.confirm_streak += 1
+                    else:
+                        state.last_signal_side = provisional_side
+                        state.confirm_streak = 1
+
+                should_enter = provisional_side is not None and state.confirm_streak >= self.breakout_confirm_ticks
+                self.log.debug(
+                    "%s delta=%.4f%% lookback=%ss streak=%d side=%s",
+                    symbol,
+                    change_pct,
+                    self.breakout_lookback_sec,
+                    state.confirm_streak,
+                    provisional_side,
                 )
-                change_pct = (price - state.last_price) / state.last_price * 100.0
-                self.log.debug("%s delta=%.4f%% last=%.8f cur=%.8f sig=%s", symbol, change_pct, state.last_price, price, sig)
-                if sig.should_enter and sig.side:
+                if should_enter and provisional_side:
                     quantity = self._round_quantity(self.position_usdt / price)
                     if quantity <= 0:
                         state.last_price = price
@@ -166,18 +208,18 @@ class PerpBot:
                         tick += 1
                         continue
 
-                    self.log.info("%s ENTRY signal side=%s qty=%.6f price=%.8f", symbol, sig.side, quantity, price)
-                    order = self.client.place_market_order(symbol=symbol, side=sig.side, quantity=quantity)
+                    self.log.info("%s ENTRY signal side=%s qty=%.6f price=%.8f", symbol, provisional_side, quantity, price)
+                    order = self.client.place_market_order(symbol=symbol, side=provisional_side, quantity=quantity)
                     if order.ok:
                         entry_price = price
                         sl, tp = compute_sl_tp_prices(
                             entry_price=entry_price,
-                            side=sig.side,
+                            side=provisional_side,
                             stop_loss_percent=self.stop_loss_percent,
                             take_profit_percent=self.take_profit_percent,
                         )
                         state.in_position = True
-                        state.side = sig.side
+                        state.side = provisional_side
                         state.quantity = quantity
                         state.entry_price = entry_price
                         state.stop_loss = sl
@@ -200,7 +242,7 @@ class PerpBot:
                         self.logger.log(
                             event="entry",
                             symbol=symbol,
-                            side=sig.side,
+                            side=provisional_side,
                             quantity=quantity,
                             price=entry_price,
                             stop_loss=sl,

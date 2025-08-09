@@ -6,7 +6,8 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Deque, Tuple
+from collections import deque
 import logging
 
 from dotenv import load_dotenv
@@ -28,6 +29,9 @@ class SymbolState:
     take_profit: float = 0.0
     order_id: Optional[str] = None
     last_exit_time: float = 0.0
+    # Signal confirmation helpers (not persisted):
+    confirm_streak: int = 0
+    last_signal_side: Optional[str] = None
 
 
 class SpotBot:
@@ -60,6 +64,8 @@ class SpotBot:
         self.position_usdt = float(self.config["position_usdt"])  # per-position target notional
         self.max_open_trades = int(self.config["max_open_trades"])
         self.breakout_change_percent = float(self.config["breakout_change_percent"])
+        self.breakout_lookback_sec = int(self.config.get("breakout_lookback_sec", 60))
+        self.breakout_confirm_ticks = int(self.config.get("breakout_confirm_ticks", 2))
         self.stop_loss_percent = float(self.config["stop_loss_percent"])
         self.take_profit_percent = float(self.config["take_profit_percent"])
         self.check_interval_sec = int(self.config["check_interval_sec"])
@@ -71,6 +77,9 @@ class SpotBot:
         self._states: Dict[str, SymbolState] = {s: SymbolState() for s in self.symbols}
         self._open_trades_lock = threading.Lock()
         self._open_trades_count = 0
+        # Per-symbol price history for lookback computations
+        history_len = max(300, int(max(1, self.breakout_lookback_sec) / max(1, self.check_interval_sec)) * 5)
+        self._price_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=history_len) for s in self.symbols}
 
         self.log.info(
             "SpotBot initialized | symbols=%s position_usdt=%s max_open_trades=%s interval=%ss cooldown=%ss dry_run=%s",
@@ -152,23 +161,50 @@ class SpotBot:
                     tick += 1
                     continue
 
-                sig = compute_breakout_signal(
-                    last_price=state.last_price,
-                    current_price=price,
-                    breakout_change_percent=self.breakout_change_percent,
-                )
-                if sig.should_enter and sig.side:
+                # Maintain price history and compute lookback delta
+                hist = self._price_history[symbol]
+                hist.append((now, price))
+                threshold_time = now - self.breakout_lookback_sec
+                old_price: Optional[float] = None
+                for ts, px in reversed(hist):
+                    if ts <= threshold_time:
+                        old_price = px
+                        break
+                if old_price is None:
+                    old_price = state.last_price if state.last_price is not None else price
+                change_pct = (price - float(old_price)) / float(old_price) * 100.0
+
+                # Contrarian breakout side based on lookback
+                provisional_side: Optional[str] = None
+                if change_pct <= -self.breakout_change_percent:
+                    provisional_side = "BUY"
+                elif change_pct >= self.breakout_change_percent:
+                    provisional_side = "SELL"
+
+                # Confirmation over N ticks
+                if provisional_side is None:
+                    state.confirm_streak = 0
+                    state.last_signal_side = None
+                else:
+                    if state.last_signal_side == provisional_side:
+                        state.confirm_streak += 1
+                    else:
+                        state.last_signal_side = provisional_side
+                        state.confirm_streak = 1
+
+                should_enter = provisional_side is not None and state.confirm_streak >= self.breakout_confirm_ticks
+                if should_enter and provisional_side:
                     quantity = self._round_quantity(self.position_usdt / price)
                     if quantity <= 0:
                         state.last_price = price
                         time.sleep(self.check_interval_sec)
                         tick += 1
                         continue
-                    self.log.info("%s ENTRY signal side=%s qty=%.6f price=%.8f", symbol, sig.side, quantity, price)
-                    if sig.side == "BUY":
-                        order = self.client.place_market_order(symbol=symbol, side=sig.side, amount=self.position_usdt)
+                    self.log.info("%s ENTRY signal side=%s qty=%.6f price=%.8f", symbol, provisional_side, quantity, price)
+                    if provisional_side == "BUY":
+                        order = self.client.place_market_order(symbol=symbol, side=provisional_side, amount=self.position_usdt)
                     else:
-                        order = self.client.place_market_order(symbol=symbol, side=sig.side, quantity=quantity)
+                        order = self.client.place_market_order(symbol=symbol, side=provisional_side, quantity=quantity)
                     if not order.ok:
                         self.log.error("%s ENTRY failed: %s", symbol, order.error)
                 state.last_price = price

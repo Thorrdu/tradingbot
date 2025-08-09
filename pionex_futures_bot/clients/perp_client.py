@@ -13,29 +13,41 @@ class PerpClient(PionexClient):
     """Thin wrapper over PionexClient for Perpetual Futures symbols.
 
     Differences vs spot client:
-    - Normalizes symbols to the PERP format, e.g. BTCUSDT → BTC_USDT_PERP
+    - Normalizes symbols to the PERP format expected by Pionex UI/API, e.g. BTCUSDT → BTCUSDT.P
+      Backward-compatible with older variants like `BTC_USDT_PERP` or `BTC.PERP_USDT`.
     - Uses `size` for MARKET BUY and SELL (Perp contracts) instead of `amount` for BUY
     - Keeps the same signing and base paths; trading endpoint remains `/api/v1/trade/order`
     """
 
     def _normalize_symbol(self, symbol: str) -> str:  # type: ignore[override]
+        """Normalize various PERP symbol inputs to `BASEUSDT.P`.
+
+        Accepted inputs (examples mapping to BTCUSDT.P):
+        - "BTCUSDT" → "BTCUSDT.P"
+        - "BTC_USDT" → "BTCUSDT.P"
+        - "BTCUSDT.P" → "BTCUSDT.P" (idempotent)
+        - "BTC_USDT_PERP" → "BTCUSDT.P"
+        - "BTC.PERP_USDT" → "BTCUSDT.P"
+        """
         s = symbol.strip().upper()
-        # UI route format like "SOL.PERP_USDT" → API expects "SOL_USDT_PERP"
+        # If already in UI futures form
+        if s.endswith(".P"):
+            return s
+        # UI route legacy like "SOL.PERP_USDT"
         if ".PERP_USDT" in s:
             base = s.split(".")[0]
-            return f"{base}_USDT_PERP"
-        # Remove dashes and dots defensively
-        s = s.replace("-", "").replace(".", "")
-        # Already normalized
+            return f"{base}USDT.P"
+        # Remove dashes and spaces defensively
+        s = s.replace("-", "").replace(" ", "")
+        # Older API-like forms
         if s.endswith("_USDT_PERP"):
-            return s
-        # SPOT-like no-underscore: BTCUSDT → BTC_USDT_PERP
-        if s.endswith("USDT") and "_" not in s:
-            base = s[:-4]
-            return f"{base}_USDT_PERP"
-        # Underscored spot form: BTC_USDT → BTC_USDT_PERP
-        if s.endswith("_USDT") and not s.endswith("_USDT_PERP"):
-            return f"{s}_PERP"
+            base = s.split("_")[0]
+            return f"{base}USDT.P"
+        if s.endswith("_USDT"):
+            base = s.split("_")[0]
+            return f"{base}USDT.P"
+        if s.endswith("USDT"):
+            return f"{s}.P"
         return s
 
     def place_market_order(
