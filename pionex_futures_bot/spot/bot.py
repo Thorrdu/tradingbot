@@ -139,11 +139,22 @@ class SpotBot:
         self.idle_backoff_sec = int(self.config.get("idle_backoff_sec", max(10, self.check_interval_sec * 6)))
         self.cooldown_sec = int(self.config["cooldown_sec"])
         self.force_min_sell = bool(self.config.get("force_min_sell", True))
+        self.sweep_dust_on_start = bool(self.config.get("sweep_dust_on_start", True))
+        self.sweep_dust_heartbeat_sec = int(self.config.get("sweep_dust_heartbeat_sec", 900))
+        self._last_sweep_ts: float = 0.0
         self.min_hold_sec = int(self.config.get("min_hold_sec", 10))
         self.exit_hysteresis_percent = float(self.config.get("exit_hysteresis_percent", 0.05))
         # Advanced mode
         self.signal_mode = str(self.config.get("mode", "contrarian")).lower()  # contrarian|momentum|auto
         self.k_threshold = float(self.config.get("z_threshold", 2.0))
+        # Auto-mode switching based on recent stats
+        self.auto_mode_enabled = bool(self.config.get("auto_mode_enabled", self.signal_mode == "auto"))
+        self.auto_mode_window_trades = int(self.config.get("auto_mode_window_trades", 20))
+        self.auto_switch_low_winrate = float(self.config.get("auto_switch_low_winrate", 45.0))
+        self.auto_switch_high_winrate = float(self.config.get("auto_switch_high_winrate", 55.0))
+        self.auto_mode_refresh_sec = int(self.config.get("auto_mode_refresh_sec", 300))
+        self.z_threshold_contrarian = float(self.config.get("z_threshold_contrarian", self.k_threshold))
+        self.z_threshold_momentum = float(self.config.get("z_threshold_momentum", max(2.0, self.k_threshold - 0.3)))
         self.ewm_lambda = float(self.config.get("ewm_lambda", 0.94))
         self.atr_window_sec = int(self.config.get("atr_window_sec", 300))
         self.alpha_sl = float(self.config.get("alpha_sl", 1.8))
@@ -180,6 +191,57 @@ class SpotBot:
         self._vol_state: Dict[str, VolatilityState] = {s: VolatilityState(ewm_var=0.0, window=deque(maxlen=300)) for s in self.symbols}
         # Track recent outcomes per symbol (for possible auto-regime)
         self._recent_outcomes: Dict[str, Deque[str]] = {s: deque(maxlen=20) for s in self.symbols}
+        # Per-symbol mode cache for auto switching
+        self._symbol_mode: Dict[str, str] = {s: ("contrarian" if self.signal_mode != "momentum" else "momentum") for s in self.symbols}
+        self._last_mode_eval_ts: float = 0.0
+        self._summary_csv_path: str = str(self.config.get("log_summary_csv", "logs/trades_summary.csv"))
+
+    def _evaluate_auto_modes_from_csv(self) -> None:
+        if not self.auto_mode_enabled:
+            return
+        now_ts = time.time()
+        if (now_ts - self._last_mode_eval_ts) < max(30, self.auto_mode_refresh_sec):
+            return
+        self._last_mode_eval_ts = now_ts
+        try:
+            import csv
+            from datetime import datetime, timedelta
+            path = Path(self._summary_csv_path)
+            if not path.exists():
+                return
+            cutoff = None  # by default use window by count
+            # Load all rows and build per-symbol lists of last N trades
+            per_sym: Dict[str, Deque[float]] = {s: deque(maxlen=self.auto_mode_window_trades) for s in self.symbols}
+            with path.open("r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+            # Iterate in reverse chronological order by exit_ts
+            rows.sort(key=lambda r: (r.get("exit_ts") or ""))
+            for row in rows:
+                sym = (row.get("symbol") or "").strip()
+                if sym not in per_sym:
+                    continue
+                try:
+                    pnl = float(row.get("pnl_usdt") or 0.0)
+                except Exception:
+                    continue
+                per_sym[sym].append(pnl)
+            for sym, pnl_list in per_sym.items():
+                if len(pnl_list) == 0:
+                    continue
+                n = len(pnl_list)
+                wins = sum(1 for v in pnl_list if v > 0)
+                win_rate = 100.0 * wins / n
+                prev_mode = self._symbol_mode.get(sym, "contrarian")
+                if win_rate < self.auto_switch_low_winrate:
+                    self._symbol_mode[sym] = "momentum"
+                elif win_rate > self.auto_switch_high_winrate:
+                    self._symbol_mode[sym] = "contrarian"
+                # Log only when changed
+                if self._symbol_mode[sym] != prev_mode:
+                    self.log.info("%s auto-mode switch: %s -> %s (win_rate=%.2f%% over %d trades)", sym, prev_mode, self._symbol_mode[sym], win_rate, n)
+        except Exception as exc:
+            self.log.debug("auto-mode eval error: %s", exc)
 
         # Load SPOT symbol trading rules (precision/min dump) from cache or API
         self._spot_rules: Dict[str, Dict[str, Any]] = {}
@@ -376,22 +438,50 @@ class SpotBot:
         rules = self._spot_rules.get(norm) or {}
         min_dump_str = rules.get("minTradeDumping") or rules.get("minTradeSize")
         max_dump_str = rules.get("maxTradeDumping") or rules.get("maxTradeSize")
+        # Default fine step
         step = 10 ** (-6)
         min_dump = 0.0
         max_dump: Optional[float] = None
         try:
+            # basePrecision can constrain decimal places for base asset
+            base_prec = rules.get("basePrecision")
+            if isinstance(base_prec, (int, float)):
+                try:
+                    step = max(step, 10 ** (-int(base_prec)))
+                except Exception:
+                    pass
             if isinstance(min_dump_str, str) and min_dump_str.strip() != "":
                 min_dump = float(min_dump_str)
                 if "." in min_dump_str:
                     decimals = len(min_dump_str.split(".")[-1])
                 else:
                     decimals = 0
-                step = 10 ** (-decimals)
+                step = max(step, 10 ** (-decimals))
             if isinstance(max_dump_str, str) and max_dump_str.strip() != "":
                 max_dump = float(max_dump_str)
         except Exception:
             pass
         return (step, min_dump, max_dump)
+
+    def _sell_dust_if_any(self, symbol: str) -> None:
+        try:
+            free_bal = self._get_free_base_balance(symbol)
+            step, min_dump, _ = self._parse_spot_rules(symbol)
+            if free_bal >= max(min_dump, step):
+                qty = self._normalize_spot_sell_quantity(symbol, free_bal, free_balance=free_bal, force_min_if_possible=True)
+                if qty > 0:
+                    try:
+                        import uuid
+                        cid = str(uuid.uuid4())
+                    except Exception:
+                        cid = None
+                    resp = self.client.place_market_order(symbol=symbol, side="SELL", quantity=qty, client_order_id=cid)
+                    if resp.ok:
+                        self.log.info("%s dust sweep: sold %.8f", symbol, qty)
+                    else:
+                        self.log.warning("%s dust sweep failed: %s", symbol, getattr(resp, "error", None))
+        except Exception as exc:
+            self.log.debug("%s dust sweep error: %s", symbol, exc)
 
     def _get_free_base_balance(self, symbol: str) -> float:
         try:
@@ -473,6 +563,13 @@ class SpotBot:
                 tick += 1
                 continue
 
+            # Periodic dust sweep when not in position (optional)
+            if (not state.in_position) and self.sweep_dust_on_start:
+                now_ts = time.time()
+                if (now_ts - self._last_sweep_ts) >= max(60, self.sweep_dust_heartbeat_sec):
+                    self._sell_dust_if_any(symbol)
+                    self._last_sweep_ts = now_ts
+
             price_resp = self.client.get_price(symbol)
             if not price_resp.ok or not price_resp.data or "price" not in price_resp.data:
                 self.log.warning("%s price fetch failed: %s", symbol, getattr(price_resp, "error", None))
@@ -526,14 +623,18 @@ class SpotBot:
 
                 # Signal by mode: z-score or legacy percent
                 if self.signal_mode in ("contrarian", "momentum", "auto"):
-                    mode_use = self.signal_mode
+                    # Auto-mode: refresh from CSV periodically and use per-symbol mode
+                    if self.signal_mode == "auto":
+                        self._evaluate_auto_modes_from_csv()
+                    mode_use = (self._symbol_mode.get(symbol, "contrarian") if self.signal_mode == "auto" else self.signal_mode)
                     # Simple regime adapter (auto): if last 10 entries TP rate < 45% → momentum, >55% → contrarian
                     # Placeholder: keep as configured for now; can be extended with real stats collector
+                    z_k = self.z_threshold_contrarian if mode_use == "contrarian" else self.z_threshold_momentum
                     sig = compute_zscore_breakout(
                         change_pct=change_pct,
                         vol_state=self._vol_state[symbol],
-                        k_threshold=self.k_threshold,
-                        mode=("contrarian" if mode_use == "auto" else mode_use),
+                        k_threshold=z_k,
+                        mode=mode_use,
                     )
                     provisional_side = sig.side
                 else:
