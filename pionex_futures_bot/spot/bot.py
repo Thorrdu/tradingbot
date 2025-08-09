@@ -387,7 +387,30 @@ class SpotBot:
                 elif price <= state.take_profit:
                     exit_reason = "TP"
 
+            # Periodic debug while managing open position
+            if tick % heartbeat_every == 0:
+                try:
+                    if state.side == "BUY":
+                        dist_sl = price - state.stop_loss
+                        dist_tp = state.take_profit - price
+                    else:
+                        dist_sl = state.stop_loss - price
+                        dist_tp = price - state.take_profit
+                    self.log.debug(
+                        "%s manage: side=%s price=%.8f sl=%.8f tp=%.8f dSL=%.8f dTP=%.8f",
+                        symbol,
+                        state.side,
+                        price,
+                        state.stop_loss,
+                        state.take_profit,
+                        dist_sl,
+                        dist_tp,
+                    )
+                except Exception:
+                    pass
+
             if exit_reason is not None:
+                self.log.info("%s EXIT trigger: reason=%s price=%.8f side=%s", symbol, exit_reason, price, state.side)
                 close_resp = self.client.close_position(symbol=symbol, side=state.side or "BUY", quantity=self._round_quantity(state.quantity))
                 if not close_resp.ok:
                     self.log.error("%s EXIT %s failed: %s", symbol, exit_reason, close_resp.error)
