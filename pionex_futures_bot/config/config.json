@@ -1,13 +1,13 @@
 {
   "base_url": "https://api.pionex.com",
   "symbols": [
-    "BTCUSDT",
-    "ETHUSDT",
-    "SOLUSDT",
-    "BNBUSDT",
-    "XRPUSDT",
-    "DOGEUSDT",
-    "ADAUSDT"
+    "BTC_USDT",
+    "ETH_USDT",
+    "SOL_USDT",
+    "BNB_USDT",
+    "XRP_USDT",
+    "DOGE_USDT",
+    "ADA_USDT"
   ],
   "leverage": 3,
   "position_usdt": 20,

@@ -1,13 +1,13 @@
 {
   "base_url": "https://api.pionex.com",
   "symbols": [
-    "BTCUSDT.P",
-    "ETHUSDT.P",
-    "SOLUSDT.P",
-    "BNBUSDT.P",
-    "XRPUSDT.P",
-    "DOGEUSDT.P",
-    "ADAUSDT.P"
+    "BTC_USDT_PERP",
+    "ETH_USDT_PERP",
+    "SOL_USDT_PERP",
+    "BNB_USDT_PERP",
+    "XRP_USDT_PERP",
+    "DOGE_USDT_PERP",
+    "ADA_USDT_PERP"
   ],
   "position_usdt": 40,
   "max_open_trades": 2,
