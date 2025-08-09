@@ -247,6 +247,7 @@ class SpotBot:
             self.log.debug("auto-mode eval error: %s", exc)
 
         # Load SPOT symbol trading rules (precision/min dump) from cache or API
+        # Defensive init to avoid AttributeError if called before population
         self._spot_rules: Dict[str, Dict[str, Any]] = {}
         try:
             from pathlib import Path as _P
@@ -438,7 +439,8 @@ class SpotBot:
         step is inferred from the decimals of minTradeDumping (or minTradeSize) when present.
         """
         norm = self.client._normalize_symbol(symbol)
-        rules = self._spot_rules.get(norm) or {}
+        rules_map = getattr(self, "_spot_rules", {}) or {}
+        rules = rules_map.get(norm) or {}
         min_dump_str = rules.get("minTradeDumping") or rules.get("minTradeSize")
         max_dump_str = rules.get("maxTradeDumping") or rules.get("maxTradeSize")
         # Default fine step
