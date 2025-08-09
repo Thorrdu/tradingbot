@@ -34,6 +34,8 @@
   "max_daily_loss_usdt": 5,
   "max_consecutive_losses": 3,
   "cooloff_sec": 1800,
+  "epsilon_pnl_usdt": 0.05,
+  "epsilon_pnl_percent": 0.10,
   "dry_run": true,
   "log_csv": "logs/trades.csv",
   "log_summary_csv": "logs/trades_summary.csv",

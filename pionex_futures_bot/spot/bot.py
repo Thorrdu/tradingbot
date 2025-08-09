@@ -155,6 +155,8 @@ class SpotBot:
         self._consec_losses = 0
         self._cooloff_until = 0.0
         self._cooloff_reason: str = ""
+        self.epsilon_pnl_usdt = float(self.config.get("epsilon_pnl_usdt", 0.05))
+        self.epsilon_pnl_percent = float(self.config.get("epsilon_pnl_percent", 0.10))
 
         self.logger = TradeLogger(self.config.get("log_csv", "trades.csv"))
         self.summary_logger = TradeSummaryLogger(self.config.get("log_summary_csv", "logs/trades_summary.csv"))
@@ -820,6 +822,13 @@ class SpotBot:
                             pnl = (price - state.entry_price) * state.quantity
                         else:
                             pnl = (state.entry_price - price) * state.quantity
+                        # Apply epsilon threshold to ignore dust-level residuals
+                        try:
+                            pnl_pct_abs = abs((price - state.entry_price) / state.entry_price * 100.0)
+                            if abs(pnl) < self.epsilon_pnl_usdt and pnl_pct_abs < self.epsilon_pnl_percent:
+                                pnl = 0.0
+                        except Exception:
+                            pass
                     except Exception:
                         pnl = 0.0
 
@@ -836,10 +845,24 @@ class SpotBot:
                     # Summarize trade for analysis
                     try:
                         pnl_percent = ((price - state.entry_price) / state.entry_price * 100.0) if (state.side == "BUY") else ((state.entry_price - price) / state.entry_price * 100.0)
+                        # Infer executed and residual qty from balances and rules
+                        executed_qty = state.quantity
+                        residual_qty = 0.0
+                        try:
+                            free_bal = self._get_free_base_balance(symbol)
+                            # residual approximated as balance post-exit (if side BUY) below precision step
+                            if state.side == "BUY":
+                                step, _, _ = self._parse_spot_rules(symbol)
+                                # Estimate expected remaining dust after sell
+                                residual_qty = max(0.0, round(free_bal % max(step, 1e-12), 12))
+                        except Exception:
+                            residual_qty = 0.0
                         self.summary_logger.log_result(
                             symbol=symbol,
                             side=state.side,
                             quantity=state.quantity,
+                            executed_qty=executed_qty,
+                            residual_qty=residual_qty,
                             entry_price=state.entry_price,
                             exit_price=price,
                             entry_time=state.entry_time,
@@ -864,7 +887,7 @@ class SpotBot:
                     try:
                         self._day_pnl += pnl
                         self._recent_outcomes[symbol].append("WIN" if pnl > 0 else "LOSS")
-                        if pnl > 0:
+                        if pnl >= 0:
                             self._consec_losses = 0
                         else:
                             self._consec_losses += 1

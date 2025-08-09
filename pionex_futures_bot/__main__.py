@@ -71,6 +71,11 @@ def main() -> None:
     p_utils.add_argument("--type", choices=["SPOT", "PERP"], help="Market type to fetch")
     p_utils.add_argument("--out", default="config/symbols.json", help="Output JSON path")
 
+    p_stats = sub.add_parser("stats", help="Compute trading statistics from summary CSV")
+    p_stats.add_argument("--file", default="logs/trades_summary.csv", help="Summary CSV file (default: logs/trades_summary.csv)")
+    p_stats.add_argument("--symbol", default=None, help="Filter by symbol (e.g., BTC_USDT)")
+    p_stats.add_argument("--since-hours", type=int, default=None, help="Only include trades with exit_ts within the last N hours")
+
     args = parser.parse_args()
 
     if args.cmd == "spot":
@@ -100,6 +105,85 @@ def main() -> None:
         }
         out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
         print(f"Saved {len(resp.data['symbols'])} symbols to {out_path}")
+    elif args.cmd == "stats":
+        import csv
+        from datetime import datetime, timedelta
+        _chdir_to_project_root()
+        csv_path = Path(args.file)
+        if not csv_path.exists():
+            print(f"Summary CSV not found: {csv_path}")
+            return
+        def parse_ts(s: str | None) -> datetime | None:
+            if not s:
+                return None
+            try:
+                # Accept ...Z suffix
+                return datetime.fromisoformat(s.replace("Z", ""))
+            except Exception:
+                return None
+        since_dt: datetime | None = None
+        if args.since_hours and args.since_hours > 0:
+            since_dt = datetime.utcnow() - timedelta(hours=args.since_hours)
+        total = 0.0
+        won = 0.0
+        lost = 0.0
+        n = 0
+        n_win = 0
+        n_loss = 0
+        n_be = 0
+        hold_sum = 0.0
+        by_reason: dict[str, int] = {}
+        with csv_path.open("r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                sym = (row.get("symbol") or "").strip()
+                if args.symbol and sym != args.symbol:
+                    continue
+                exit_ts = parse_ts(row.get("exit_ts"))
+                if since_dt and (not exit_ts or exit_ts < since_dt):
+                    continue
+                try:
+                    pnl = float(row.get("pnl_usdt") or 0.0)
+                    hold = float(row.get("hold_sec") or 0.0)
+                except Exception:
+                    continue
+                n += 1
+                total += pnl
+                hold_sum += hold
+                reason = (row.get("exit_reason") or "").strip() or "UNKNOWN"
+                by_reason[reason] = by_reason.get(reason, 0) + 1
+                if pnl > 0:
+                    n_win += 1
+                    won += pnl
+                elif pnl < 0:
+                    n_loss += 1
+                    lost += abs(pnl)
+                else:
+                    n_be += 1
+        def fmt_dur(s: float) -> str:
+            sec = int(round(max(0.0, s)))
+            h, rem = divmod(sec, 3600)
+            m, s2 = divmod(rem, 60)
+            if h:
+                return f"{h}h{m:02}m{s2:02}s"
+            if m:
+                return f"{m}m{s2:02}s"
+            return f"{s:.1f}s"
+        avg_hold = hold_sum / n if n else 0.0
+        win_rate = (n_win / n * 100.0) if n else 0.0
+        print("=== Trading statistics ===")
+        print(f"File: {csv_path}")
+        if args.symbol:
+            print(f"Symbol: {args.symbol}")
+        if since_dt:
+            print(f"Since: last {args.since_hours}h (>= {since_dt.isoformat()}Z)")
+        print(f"Trades: {n}  |  Wins: {n_win}  Losses: {n_loss}  BE: {n_be}  |  Win rate: {win_rate:.2f}%")
+        print(f"Total PnL: {total:.4f} USDT  |  Won: {won:.4f}  Lost: -{lost:.4f}")
+        print(f"Average hold: {fmt_dur(avg_hold)}")
+        if by_reason:
+            print("By reason:")
+            for k, v in sorted(by_reason.items(), key=lambda kv: (-kv[1], kv[0])):
+                print(f"  {k}: {v}")
     else:
         parser.print_help()
 
