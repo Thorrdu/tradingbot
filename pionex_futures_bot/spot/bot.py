@@ -76,6 +76,7 @@ class SpotBot:
         self.leverage = int(self.config.get("leverage", 1))
         self.position_usdt = float(self.config["position_usdt"])  # per-position target notional
         self.max_open_trades = int(self.config["max_open_trades"])
+        self.max_open_trades_per_symbol = int(self.config.get("max_open_trades_per_symbol", 1))
         self.breakout_change_percent = float(self.config["breakout_change_percent"])
         self.breakout_lookback_sec = int(self.config.get("breakout_lookback_sec", 60))
         self.breakout_confirm_ticks = int(self.config.get("breakout_confirm_ticks", 2))
@@ -90,9 +91,36 @@ class SpotBot:
         self._states: Dict[str, SymbolState] = {s: SymbolState() for s in self.symbols}
         self._open_trades_lock = threading.Lock()
         self._open_trades_count = 0
+        self._symbol_open_count: Dict[str, int] = {s: 0 for s in self.symbols}
         # Per-symbol price history for lookback computations
         history_len = max(300, int(max(1, self.breakout_lookback_sec) / max(1, self.check_interval_sec)) * 5)
         self._price_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=history_len) for s in self.symbols}
+
+        # Resume state from previous run if available
+        try:
+            persisted = self.state_store.load()
+            for sym, st in self._states.items():
+                ps = persisted.get(sym, {}) if isinstance(persisted, dict) else {}
+                if isinstance(ps, dict):
+                    st.in_position = bool(ps.get("in_position", False))
+                    st.side = ps.get("side")
+                    try:
+                        st.quantity = float(ps.get("quantity", 0.0))
+                        st.entry_price = float(ps.get("entry_price", 0.0))
+                        st.stop_loss = float(ps.get("stop_loss", 0.0))
+                        st.take_profit = float(ps.get("take_profit", 0.0))
+                        st.last_exit_time = float(ps.get("last_exit_time", 0.0))
+                    except Exception:
+                        pass
+                    st.order_id = ps.get("order_id")
+            # Initialize open trades counter from resumed state
+            self._open_trades_count = sum(1 for st in self._states.values() if st.in_position)
+            for sym, st in self._states.items():
+                self._symbol_open_count[sym] = 1 if st.in_position else 0
+            if self._open_trades_count:
+                self.log.info("Resumed %d open trade(s) from state store", self._open_trades_count)
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("Failed to resume state: %s", exc)
 
         self.log.info(
             "SpotBot initialized | symbols=%s position_usdt=%s max_open_trades=%s interval=%ss cooldown=%ss dry_run=%s",
@@ -108,6 +136,16 @@ class SpotBot:
         with self._open_trades_lock:
             return self._open_trades_count < self.max_open_trades
 
+    def _try_reserve_open_slot(self) -> bool:
+        """Atomiquement, réserve un slot d'ouverture si disponible.
+        Retourne True si réservé, False sinon.
+        """
+        with self._open_trades_lock:
+            if self._open_trades_count < self.max_open_trades:
+                self._open_trades_count += 1
+                return True
+            return False
+
     def _on_open(self) -> None:
         with self._open_trades_lock:
             self._open_trades_count += 1
@@ -116,6 +154,20 @@ class SpotBot:
         with self._open_trades_lock:
             if self._open_trades_count > 0:
                 self._open_trades_count -= 1
+
+    def _try_reserve_symbol_slot(self, symbol: str) -> bool:
+        with self._open_trades_lock:
+            current = self._symbol_open_count.get(symbol, 0)
+            if current < self.max_open_trades_per_symbol:
+                self._symbol_open_count[symbol] = current + 1
+                return True
+            return False
+
+    def _release_symbol_slot(self, symbol: str) -> None:
+        with self._open_trades_lock:
+            current = self._symbol_open_count.get(symbol, 0)
+            if current > 0:
+                self._symbol_open_count[symbol] = current - 1
 
     def _round_quantity(self, quantity: float) -> float:
         return max(round(quantity, 6), 0.0)
@@ -220,8 +272,29 @@ class SpotBot:
 
                 should_enter = provisional_side is not None and state.confirm_streak >= self.breakout_confirm_ticks
                 if should_enter and provisional_side:
+                    # Per-symbol cap first
+                    if not self._try_reserve_symbol_slot(symbol):
+                        state.last_price = price
+                        if tick % heartbeat_every == 0:
+                            self.log.info("%s heartbeat: per-symbol cap reached (%d)", symbol, self.max_open_trades_per_symbol)
+                        time.sleep(self.check_interval_sec)
+                        tick += 1
+                        continue
+                    # Double garde: si le plafond global est atteint entre-temps, abandonner l'entrée
+                    if not self._try_reserve_open_slot():
+                        # Libère la réservation par symbole
+                        self._release_symbol_slot(symbol)
+                        state.last_price = price
+                        if tick % heartbeat_every == 0:
+                            self.log.info("%s heartbeat: slot unavailable at entry time (max_open_trades)", symbol)
+                        time.sleep(self.check_interval_sec)
+                        tick += 1
+                        continue
                     quantity = self._round_quantity(self.position_usdt / price)
                     if quantity <= 0:
+                        # Libère le slot réservé inutilement
+                        self._on_close()
+                        self._release_symbol_slot(symbol)
                         state.last_price = price
                         time.sleep(self.check_interval_sec)
                         tick += 1
@@ -233,13 +306,124 @@ class SpotBot:
                         order = self.client.place_market_order(symbol=symbol, side=provisional_side, quantity=quantity)
                     if not order.ok:
                         self.log.error("%s ENTRY failed: %s", symbol, order.error)
+                        # Libère le slot réservé car l'ordre a échoué
+                        self._on_close()
+                        self._release_symbol_slot(symbol)
+                    else:
+                        # Determine actual entry quantity and price
+                        entry_price = price
+                        entry_qty = quantity if provisional_side == "SELL" else self._round_quantity(self.position_usdt / price)
+                        try:
+                            # In live mode, refine using fills if available
+                            if not bool(self.config.get("dry_run", True)):
+                                inferred = self.client.infer_position_from_fills(symbol)
+                                if inferred.get("in_position") and inferred.get("side") == provisional_side:
+                                    q = float(inferred.get("quantity", entry_qty))
+                                    px = float(inferred.get("entry_price", entry_price))
+                                    if q > 0:
+                                        entry_qty = self._round_quantity(q)
+                                    if px > 0:
+                                        entry_price = px
+                        except Exception:
+                            pass
+
+                        sl, tp = compute_sl_tp_prices(
+                            entry_price=entry_price,
+                            side=provisional_side,  # type: ignore[arg-type]
+                            stop_loss_percent=self.stop_loss_percent,
+                            take_profit_percent=self.take_profit_percent,
+                        )
+                        state.in_position = True
+                        state.side = provisional_side
+                        state.quantity = entry_qty
+                        state.entry_price = entry_price
+                        state.stop_loss = sl
+                        state.take_profit = tp
+                        state.order_id = (order.data or {}).get("orderId") if hasattr(order, "data") else None
+                        state.confirm_streak = 0
+                        state.last_signal_side = None
+                        # Le slot global et le slot symbole sont déjà réservés, ne pas ré-incrémenter
+                        # Persist and log
+                        self.state_store.update_symbol(
+                            symbol,
+                            {
+                                "in_position": True,
+                                "side": state.side,
+                                "quantity": state.quantity,
+                                "entry_price": state.entry_price,
+                                "stop_loss": state.stop_loss,
+                                "take_profit": state.take_profit,
+                                "order_id": state.order_id,
+                                "last_exit_time": state.last_exit_time,
+                            },
+                        )
+                        self.logger.log(
+                            event="ENTRY",
+                            symbol=symbol,
+                            side=state.side,
+                            quantity=state.quantity,
+                            price=state.entry_price,
+                            stop_loss=state.stop_loss,
+                            take_profit=state.take_profit,
+                            order_id=state.order_id,
+                            reason="breakout",
+                        )
                 state.last_price = price
                 time.sleep(self.check_interval_sec)
                 tick += 1
                 continue
 
-            # Manage open position (same heartbeat/logging style as original bot)
+            # Manage open position: check SL/TP and exit if hit
             state.last_price = price
+            exit_reason: Optional[str] = None
+            if state.side == "BUY":
+                if price <= state.stop_loss:
+                    exit_reason = "SL"
+                elif price >= state.take_profit:
+                    exit_reason = "TP"
+            elif state.side == "SELL":
+                if price >= state.stop_loss:
+                    exit_reason = "SL"
+                elif price <= state.take_profit:
+                    exit_reason = "TP"
+
+            if exit_reason is not None:
+                close_resp = self.client.close_position(symbol=symbol, side=state.side or "BUY", quantity=self._round_quantity(state.quantity))
+                if not close_resp.ok:
+                    self.log.error("%s EXIT %s failed: %s", symbol, exit_reason, close_resp.error)
+                else:
+                    pnl = 0.0
+                    try:
+                        if (state.side or "BUY") == "BUY":
+                            pnl = (price - state.entry_price) * state.quantity
+                        else:
+                            pnl = (state.entry_price - price) * state.quantity
+                    except Exception:
+                        pnl = 0.0
+
+                    self.logger.log(
+                        event=f"EXIT_{exit_reason}",
+                        symbol=symbol,
+                        side=state.side,
+                        quantity=state.quantity,
+                        price=price,
+                        order_id=(close_resp.data or {}).get("orderId") if hasattr(close_resp, "data") else None,
+                        pnl=pnl,
+                        reason=exit_reason,
+                    )
+                    # Clear persistent state and mark cooldown
+                    state.in_position = False
+                    state.side = None
+                    state.quantity = 0.0
+                    state.entry_price = 0.0
+                    state.stop_loss = 0.0
+                    state.take_profit = 0.0
+                    state.order_id = None
+                    state.last_exit_time = time.time()
+                    self._on_close()
+                    self._release_symbol_slot(symbol)
+                    self.state_store.clear_symbol(symbol)
+
             time.sleep(self.check_interval_sec)
             tick += 1
 
