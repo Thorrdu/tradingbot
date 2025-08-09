@@ -177,11 +177,51 @@ class SpotBot:
         except Exception as _e:
             self.log.debug("Failed to load SPOT rules: %s", _e)
 
-        # Resume state from previous run if available
+        # Resume state from previous run if available (supports cross-profile resume)
         try:
+            # Primary state file
             persisted = self.state_store.load()
+            if not isinstance(persisted, dict):
+                persisted = {}
+            # Also try alternative state files so we can resume when switching profiles
+            alt_states: list[dict] = []
+            try:
+                primary_state_path = Path(self.config.get("state_file", "logs/runtime_state.json"))
+                # Common alternates
+                alternates = [
+                    Path("logs/runtime_state.json"),
+                    Path("logs/runtime_state_trending.json"),
+                ]
+                # Add derived alternate (swap between trending and default)
+                if "trending" in str(primary_state_path):
+                    alternates.insert(0, Path("logs/runtime_state.json"))
+                else:
+                    alternates.insert(0, Path("logs/runtime_state_trending.json"))
+                # Load distinct existing files except the primary one
+                seen = set([str(primary_state_path.resolve()) if primary_state_path.exists() else str(primary_state_path)])
+                for p in alternates:
+                    try:
+                        if p.exists():
+                            rp = str(p.resolve())
+                            if rp in seen:
+                                continue
+                            seen.add(rp)
+                            from pionex_futures_bot.common.state_store import StateStore as _SS
+                            alt = _SS(p).load()
+                            if isinstance(alt, dict):
+                                alt_states.append(alt)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
             for sym, st in self._states.items():
                 ps = persisted.get(sym, {}) if isinstance(persisted, dict) else {}
+                if (not ps) and alt_states:
+                    # Pull first match from alternates if present
+                    for alt in alt_states:
+                        if sym in alt and isinstance(alt[sym], dict):
+                            ps = alt[sym]
+                            break
                 if isinstance(ps, dict):
                     st.in_position = bool(ps.get("in_position", False))
                     st.side = ps.get("side")
