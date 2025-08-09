@@ -313,18 +313,43 @@ class SpotBot:
                             alt = _SS(p).load()
                             if isinstance(alt, dict):
                                 alt_states.append(alt)
+                                try:
+                                    self.log.info("Alt state loaded: %s (keys=%d)", rp, len(alt.keys()))
+                                except Exception:
+                                    pass
                     except Exception:
                         continue
             except Exception:
                 pass
             resumed_count = 0
             for sym, st in self._states.items():
-                ps = persisted.get(sym, {}) if isinstance(persisted, dict) else {}
+                # Try multiple key variants to maximize resume compatibility
+                key_variants = []
+                try:
+                    norm = self.client._normalize_symbol(sym)
+                except Exception:
+                    norm = sym
+                key_variants.extend([sym, norm])
+                try:
+                    key_variants.append(sym.replace("_", ""))
+                    key_variants.append(norm.replace("_", ""))
+                except Exception:
+                    pass
+                ps = {}
+                for k in key_variants:
+                    if isinstance(persisted, dict) and k in persisted and isinstance(persisted[k], dict):
+                        ps = persisted[k]
+                        break
                 if (not ps) and alt_states:
                     # Pull first match from alternates if present
                     for alt in alt_states:
-                        if sym in alt and isinstance(alt[sym], dict):
-                            ps = alt[sym]
+                        found = None
+                        for k in key_variants:
+                            if k in alt and isinstance(alt[k], dict):
+                                found = alt[k]
+                                break
+                        if found:
+                            ps = found
                             break
                 if isinstance(ps, dict):
                     st.in_position = bool(ps.get("in_position", False))
@@ -354,9 +379,27 @@ class SpotBot:
                             pass
                     if st.in_position:
                         resumed_count += 1
+                        # Reflect resumed positions in counters to prevent over-opening
+                        try:
+                            with self._open_trades_lock:
+                                self._open_trades_count += 1
+                                self._symbol_open_count[sym] = self._symbol_open_count.get(sym, 0) + 1
+                            self.log.info(
+                                "%s resume: in_position side=%s qty=%.6f entry=%.8f sl=%.8f tp=%.8f",
+                                sym,
+                                st.side,
+                                st.quantity,
+                                st.entry_price,
+                                st.stop_loss,
+                                st.take_profit,
+                            )
+                        except Exception:
+                            pass
             # Startup resume summary
             try:
-                self.log.info("State resume | primary=%s resumed=%d symbols", self.config.get("state_file", "logs/runtime_state.json"), resumed_count)
+                prim = str(primary_state_path)
+                prim_keys = len(persisted.keys()) if isinstance(persisted, dict) else 0
+                self.log.info("State resume | primary=%s (keys=%d) resumed=%d symbols", prim, prim_keys, resumed_count)
             except Exception:
                 pass
             # Initialize open trades counter from resumed state
@@ -510,6 +553,72 @@ class SpotBot:
         except Exception:
             return 0.0
         return 0.0
+
+    def _get_free_quote_balance(self) -> float:
+        try:
+            resp = self.client.get_balances()
+            if not resp.ok or not resp.data:
+                return 0.0
+            balances = resp.data.get("data", {}).get("balances", []) if isinstance(resp.data, dict) else []
+            for b in balances:
+                if isinstance(b, dict) and str(b.get("coin", "")).upper() == "USDT":
+                    return float(b.get("free", 0.0))
+        except Exception:
+            return 0.0
+        return 0.0
+
+    def _parse_spot_buy_rules(self, symbol: str) -> Tuple[int, float]:
+        """Return (amount_precision, min_amount_usdt) for MARKET BUY."""
+        try:
+            norm = self.client._normalize_symbol(symbol)
+            rules = (getattr(self, "_spot_rules", {}) or {}).get(norm) or {}
+            amount_precision = int(rules.get("amountPrecision", 2))
+            min_amount_str = rules.get("minAmount")
+            min_amount = float(min_amount_str) if isinstance(min_amount_str, str) and min_amount_str.strip() != "" else 0.0
+            return (amount_precision, min_amount)
+        except Exception:
+            return (2, 0.0)
+
+    def _normalize_spot_buy_amount(self, symbol: str, budget_usdt: float, price: float) -> float:
+        """Compute a MARKET BUY amount that:
+        - aligns the implied quantity to base step to reduce sell dust
+        - respects amountPrecision and minAmount
+        - caps to free USDT and applies a small negative bias
+        Returns 0.0 if not feasible (e.g., below minAmount or no funds).
+        """
+        free_usdt = self._get_free_quote_balance()
+        if free_usdt <= 0 or price <= 0:
+            return 0.0
+        # Reserve tiny buffer (fees/slippage)
+        bias = max(0.0, self.buy_align_bias_bps) / 10000.0
+        spend = min(budget_usdt, free_usdt) * (1.0 - bias)
+        step, min_dump, _ = self._parse_spot_rules(symbol)
+        # Align quantity to step
+        qty_raw = spend / price
+        if step > 0:
+            import math
+            qty_target = math.floor(qty_raw / step) * step
+        else:
+            qty_target = qty_raw
+        # Ensure not below minimal sell size for future exit
+        qty_target = max(qty_target, max(min_dump, step))
+        amount_aligned = qty_target * price
+        # Enforce amount precision and minAmount
+        amount_precision, min_amount = self._parse_spot_buy_rules(symbol)
+        try:
+            factor = 10 ** int(amount_precision)
+            amount_aligned = int(amount_aligned * factor) / factor
+        except Exception:
+            pass
+        if amount_aligned < (min_amount or 0.0):
+            # Try using exact minAmount if funds allow
+            if free_usdt >= (min_amount or 0.0) > 0:
+                amount_aligned = float(min_amount)
+            else:
+                return 0.0
+        # Final cap by free balance
+        amount_aligned = min(amount_aligned, free_usdt)
+        return max(0.0, amount_aligned)
 
     def _normalize_spot_sell_quantity(self, symbol: str, quantity: float, *, free_balance: float, force_min_if_possible: bool) -> float:
         """Normalize sell size to exchange filters for SPOT market.
@@ -727,34 +836,17 @@ class SpotBot:
                                 min_amount = float(rules.get("minAmount"))
                         except Exception:
                             min_amount = None
-                        buy_amount = max(self.position_usdt, min_amount or 0.0)
-                        if self.buy_align_step:
-                            try:
-                                step, min_dump, _ = self._parse_spot_rules(symbol)
-                                # Target quantity aligned to step
-                                qty_raw = self.position_usdt / price if price > 0 else 0.0
-                                if step > 0 and qty_raw > 0:
-                                    import math
-                                    qty_target = math.floor(qty_raw / step) * step
-                                    if qty_target < max(min_dump, step):
-                                        qty_target = max(min_dump, step)
-                                    # Bias the amount downward slightly to avoid overshoot due to slippage
-                                    bias = max(0.0, self.buy_align_bias_bps) / 10000.0
-                                    aligned_amount = qty_target * price * (1.0 - bias)
-                                    if min_amount is not None:
-                                        aligned_amount = max(aligned_amount, min_amount)
-                                    if aligned_amount > 0:
-                                        buy_amount = aligned_amount
-                                        self.log.debug(
-                                            "%s BUY align: qty_raw=%.8f qty_target=%.8f step=%.g amount=%.6f",
-                                            symbol,
-                                            qty_raw,
-                                            qty_target,
-                                            step,
-                                            buy_amount,
-                                        )
-                            except Exception:
-                                pass
+                        # Compute a safe aligned amount
+                        buy_amount = self._normalize_spot_buy_amount(symbol, max(self.position_usdt, min_amount or 0.0), price)
+                        if buy_amount <= 0:
+                            self.log.warning("%s ENTRY skipped: cannot meet minAmount or insufficient USDT", symbol)
+                            # Free reserved slots
+                            self._on_close()
+                            self._release_symbol_slot(symbol)
+                            state.last_price = price
+                            time.sleep(self.check_interval_sec)
+                            tick += 1
+                            continue
                         order = self.client.place_market_order(symbol=symbol, side=provisional_side, amount=buy_amount, client_order_id=client_id)
                     else:
                         order = self.client.place_market_order(symbol=symbol, side=provisional_side, quantity=quantity, client_order_id=client_id)
