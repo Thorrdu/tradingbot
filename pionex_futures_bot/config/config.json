@@ -17,13 +17,13 @@
   "breakout_lookback_sec": 60,
   "breakout_confirm_ticks": 2,
   "mode": "contrarian",
-  "z_threshold": 2.2,
+  "z_threshold": 2.4,
   "ewm_lambda": 0.94,
-  "atr_window_sec": 300,
-  "alpha_sl": 1.8,
-  "beta_tp": 2.6,
-  "min_hold_sec": 15,
-  "exit_hysteresis_percent": 0.08,
+  "atr_window_sec": 480,
+  "alpha_sl": 2.2,
+  "beta_tp": 3.2,
+  "min_hold_sec": 25,
+  "exit_hysteresis_percent": 0.10,
   "stop_loss_percent": 2.0,
   "take_profit_percent": 3.0,
   "check_interval_sec": 4,
@@ -36,6 +36,7 @@
   "cooloff_sec": 1800,
   "dry_run": true,
   "log_csv": "logs/trades.csv",
+  "log_summary_csv": "logs/trades_summary.csv",
   "state_file": "logs/runtime_state.json"
 }
 

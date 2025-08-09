@@ -46,7 +46,7 @@ from pionex_futures_bot.common.strategy import (
     compute_zscore_breakout,
     compute_atr_sl_tp,
 )
-from pionex_futures_bot.common.trade_logger import TradeLogger
+from pionex_futures_bot.common.trade_logger import TradeLogger, TradeSummaryLogger
 from pionex_futures_bot.common.state_store import StateStore
 
 
@@ -154,8 +154,10 @@ class SpotBot:
         self._day_pnl = 0.0
         self._consec_losses = 0
         self._cooloff_until = 0.0
+        self._cooloff_reason: str = ""
 
         self.logger = TradeLogger(self.config.get("log_csv", "trades.csv"))
+        self.summary_logger = TradeSummaryLogger(self.config.get("log_summary_csv", "logs/trades_summary.csv"))
         self.state_store = StateStore(self.config.get("state_file", "runtime_state.json"))
         self._states: Dict[str, SymbolState] = {s: SymbolState() for s in self.symbols}
         self._open_trades_lock = threading.Lock()
@@ -461,11 +463,6 @@ class SpotBot:
                 tick += 1
                 continue
 
-            # Respect cool-off if in effect
-            if self._cooloff_until and time.time() < self._cooloff_until:
-                time.sleep(min(self.check_interval_sec, max(0.0, self._cooloff_until - time.time())))
-                tick += 1
-                continue
             price_resp = self.client.get_price(symbol)
             if not price_resp.ok or not price_resp.data or "price" not in price_resp.data:
                 self.log.warning("%s price fetch failed: %s", symbol, getattr(price_resp, "error", None))
@@ -477,6 +474,14 @@ class SpotBot:
             now = time.time()
 
             if not state.in_position:
+                # During cool-off, do not open new positions but keep managing existing ones
+                if self._cooloff_until and now < self._cooloff_until:
+                    state.last_price = price
+                    if tick % heartbeat_every == 0:
+                        self.log.info("%s heartbeat: cool-off active (%ds left), price=%.8f", symbol, int(self._cooloff_until - now), price)
+                    time.sleep(self.check_interval_sec)
+                    tick += 1
+                    continue
                 if state.last_exit_time and (now - state.last_exit_time) < self.cooldown_sec:
                     state.last_price = price
                     if tick % heartbeat_every == 0:
@@ -828,6 +833,33 @@ class SpotBot:
                         pnl=pnl,
                         reason=exit_reason,
                     )
+                    # Summarize trade for analysis
+                    try:
+                        pnl_percent = ((price - state.entry_price) / state.entry_price * 100.0) if (state.side == "BUY") else ((state.entry_price - price) / state.entry_price * 100.0)
+                        self.summary_logger.log_result(
+                            symbol=symbol,
+                            side=state.side,
+                            quantity=state.quantity,
+                            entry_price=state.entry_price,
+                            exit_price=price,
+                            entry_time=state.entry_time,
+                            exit_time=time.time(),
+                            pnl_usdt=pnl,
+                            pnl_percent=pnl_percent,
+                            exit_reason=exit_reason,
+                            meta={
+                                "mode": self.signal_mode,
+                                "z_threshold": self.k_threshold,
+                                "alpha_sl": self.alpha_sl,
+                                "beta_tp": self.beta_tp,
+                                "atr_window_sec": self.atr_window_sec,
+                                "breakout_change_percent": self.breakout_change_percent,
+                                "breakout_lookback_sec": self.breakout_lookback_sec,
+                                "breakout_confirm_ticks": self.breakout_confirm_ticks,
+                            },
+                        )
+                    except Exception:
+                        pass
                     # Update daily loss and streaks
                     try:
                         self._day_pnl += pnl
@@ -839,10 +871,28 @@ class SpotBot:
                         # Apply caps
                         if self.max_daily_loss_usdt and self._day_pnl <= -abs(self.max_daily_loss_usdt):
                             self._cooloff_until = time.time() + max(self.cooloff_sec, 1800)
-                            self.log.warning("Daily loss cap reached: entering cool-off for %ss", int(self._cooloff_until - time.time()))
+                            self._cooloff_reason = "daily_loss"
+                            dur = int(self._cooloff_until - time.time())
+                            self.log.warning("Daily loss cap reached: entering cool-off for %ss", dur)
+                            self.log.info(
+                                "Cool-off started: reason=%s duration=%ds day_pnl=%.2f consec_losses=%d",
+                                self._cooloff_reason,
+                                dur,
+                                self._day_pnl,
+                                self._consec_losses,
+                            )
                         if self.max_consecutive_losses and self._consec_losses >= self.max_consecutive_losses:
                             self._cooloff_until = time.time() + max(self.cooloff_sec, 900)
-                            self.log.warning("Consecutive losses cap reached: entering cool-off for %ss", int(self._cooloff_until - time.time()))
+                            self._cooloff_reason = "consec_losses"
+                            dur = int(self._cooloff_until - time.time())
+                            self.log.warning("Consecutive losses cap reached: entering cool-off for %ss", dur)
+                            self.log.info(
+                                "Cool-off started: reason=%s duration=%ds day_pnl=%.2f consec_losses=%d",
+                                self._cooloff_reason,
+                                dur,
+                                self._day_pnl,
+                                self._consec_losses,
+                            )
                     except Exception:
                         pass
                     # Clear persistent state and mark cooldown
