@@ -10,6 +10,23 @@ from collections import deque
 import logging
 from logging.handlers import TimedRotatingFileHandler
 
+
+class _ImportantOnlyFilter(logging.Filter):
+    KEYWORDS = (
+        "ENTRY",
+        "EXIT",
+        "initialized",
+        "Resumed",
+        "Stopping",
+        "Started",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+        if record.levelno >= logging.WARNING:
+            return True
+        msg = record.getMessage()
+        return any(k in msg for k in self.KEYWORDS)
+
 from dotenv import load_dotenv
 
 from pionex_futures_bot.common.trade_logger import TradeLogger
@@ -72,6 +89,8 @@ class PerpBot:
                 fmt="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
             ))
+            fh.setLevel(logging.INFO)
+            fh.addFilter(_ImportantOnlyFilter())
             if not any(isinstance(h, TimedRotatingFileHandler) and getattr(h, 'baseFilename', '') == fh.baseFilename for h in self.log.handlers):
                 self.log.addHandler(fh)
         except Exception:
