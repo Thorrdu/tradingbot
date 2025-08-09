@@ -258,6 +258,7 @@ class PionexClient:
         side: str,
         quantity: Optional[float] = None,
         amount: Optional[float] = None,
+        client_order_id: Optional[str] = None,
     ) -> ApiResponse:
         if self.dry_run:
             return ApiResponse(
@@ -282,6 +283,8 @@ class PionexClient:
             "side": side.upper(),
             "type": "MARKET",
         }
+        if client_order_id:
+            payload["clientOrderId"] = str(client_order_id)
         if side.upper() == "BUY":
             if amount is None and quantity is not None:
                 # Fallback: treat quantity as amount if not provided

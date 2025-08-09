@@ -38,7 +38,14 @@ class _ImportantOnlyFilter(logging.Filter):
 from dotenv import load_dotenv
 
 from pionex_futures_bot.clients import PionexClient
-from pionex_futures_bot.common.strategy import compute_breakout_signal, compute_sl_tp_prices
+from pionex_futures_bot.common.strategy import (
+    compute_breakout_signal,
+    compute_sl_tp_prices,
+    VolatilityState,
+    update_volatility_state,
+    compute_zscore_breakout,
+    compute_atr_sl_tp,
+)
 from pionex_futures_bot.common.trade_logger import TradeLogger
 from pionex_futures_bot.common.state_store import StateStore
 
@@ -133,6 +140,20 @@ class SpotBot:
         self.force_min_sell = bool(self.config.get("force_min_sell", True))
         self.min_hold_sec = int(self.config.get("min_hold_sec", 10))
         self.exit_hysteresis_percent = float(self.config.get("exit_hysteresis_percent", 0.05))
+        # Advanced mode
+        self.signal_mode = str(self.config.get("mode", "contrarian")).lower()  # contrarian|momentum|auto
+        self.k_threshold = float(self.config.get("z_threshold", 2.0))
+        self.ewm_lambda = float(self.config.get("ewm_lambda", 0.94))
+        self.atr_window_sec = int(self.config.get("atr_window_sec", 300))
+        self.alpha_sl = float(self.config.get("alpha_sl", 1.8))
+        self.beta_tp = float(self.config.get("beta_tp", 2.6))
+        # Risk control
+        self.max_daily_loss_usdt = float(self.config.get("max_daily_loss_usdt", 0.0))  # 0 disables
+        self.max_consecutive_losses = int(self.config.get("max_consecutive_losses", 0))  # 0 disables
+        self.cooloff_sec = int(self.config.get("cooloff_sec", 0))
+        self._day_pnl = 0.0
+        self._consec_losses = 0
+        self._cooloff_until = 0.0
 
         self.logger = TradeLogger(self.config.get("log_csv", "trades.csv"))
         self.state_store = StateStore(self.config.get("state_file", "runtime_state.json"))
@@ -143,6 +164,10 @@ class SpotBot:
         # Per-symbol price history for lookback computations
         history_len = max(300, int(max(1, self.breakout_lookback_sec) / max(1, self.check_interval_sec)) * 5)
         self._price_history: Dict[str, Deque[Tuple[float, float]]] = {s: deque(maxlen=history_len) for s in self.symbols}
+        # Volatility per symbol
+        self._vol_state: Dict[str, VolatilityState] = {s: VolatilityState(ewm_var=0.0, window=deque(maxlen=300)) for s in self.symbols}
+        # Track recent outcomes per symbol (for possible auto-regime)
+        self._recent_outcomes: Dict[str, Deque[str]] = {s: deque(maxlen=20) for s in self.symbols}
 
         # Load SPOT symbol trading rules (precision/min dump) from cache or API
         self._spot_rules: Dict[str, Dict[str, Any]] = {}
@@ -436,6 +461,11 @@ class SpotBot:
                 tick += 1
                 continue
 
+            # Respect cool-off if in effect
+            if self._cooloff_until and time.time() < self._cooloff_until:
+                time.sleep(min(self.check_interval_sec, max(0.0, self._cooloff_until - time.time())))
+                tick += 1
+                continue
             price_resp = self.client.get_price(symbol)
             if not price_resp.ok or not price_resp.data or "price" not in price_resp.data:
                 self.log.warning("%s price fetch failed: %s", symbol, getattr(price_resp, "error", None))
@@ -475,13 +505,28 @@ class SpotBot:
                 if old_price is None:
                     old_price = state.last_price if state.last_price is not None else price
                 change_pct = (price - float(old_price)) / float(old_price) * 100.0
+                # Update vol state with per-tick return (always update)
+                ret_pct = (price - (state.last_price or price)) / (state.last_price or price) * 100.0
+                self._vol_state[symbol] = update_volatility_state(state=self._vol_state[symbol], ret=ret_pct, lambda_ewm=self.ewm_lambda)
 
-                # Contrarian breakout side based on lookback
-                provisional_side: Optional[str] = None
-                if change_pct <= -self.breakout_change_percent:
-                    provisional_side = "BUY"
-                elif change_pct >= self.breakout_change_percent:
-                    provisional_side = "SELL"
+                # Signal by mode: z-score or legacy percent
+                if self.signal_mode in ("contrarian", "momentum", "auto"):
+                    mode_use = self.signal_mode
+                    # Simple regime adapter (auto): if last 10 entries TP rate < 45% → momentum, >55% → contrarian
+                    # Placeholder: keep as configured for now; can be extended with real stats collector
+                    sig = compute_zscore_breakout(
+                        change_pct=change_pct,
+                        vol_state=self._vol_state[symbol],
+                        k_threshold=self.k_threshold,
+                        mode=("contrarian" if mode_use == "auto" else mode_use),
+                    )
+                    provisional_side = sig.side
+                else:
+                    provisional_side = None
+                    if change_pct <= -self.breakout_change_percent:
+                        provisional_side = "BUY"
+                    elif change_pct >= self.breakout_change_percent:
+                        provisional_side = "SELL"
 
                 # Confirmation over N ticks
                 if provisional_side is None:
@@ -538,10 +583,25 @@ class SpotBot:
                         tick += 1
                         continue
                     self.log.info("%s ENTRY signal side=%s qty=%.6f price=%.8f", symbol, provisional_side, quantity, price)
+                    client_id = None
+                    try:
+                        import uuid
+                        client_id = str(uuid.uuid4())
+                    except Exception:
+                        client_id = None
                     if provisional_side == "BUY":
-                        order = self.client.place_market_order(symbol=symbol, side=provisional_side, amount=self.position_usdt)
+                        # Check minAmount from rules (fallback to position_usdt)
+                        min_amount = None
+                        try:
+                            rules = self._spot_rules.get(self.client._normalize_symbol(symbol)) or {}
+                            if rules.get("minAmount") is not None:
+                                min_amount = float(rules.get("minAmount"))
+                        except Exception:
+                            min_amount = None
+                        buy_amount = max(self.position_usdt, min_amount or 0.0)
+                        order = self.client.place_market_order(symbol=symbol, side=provisional_side, amount=buy_amount, client_order_id=client_id)
                     else:
-                        order = self.client.place_market_order(symbol=symbol, side=provisional_side, quantity=quantity)
+                        order = self.client.place_market_order(symbol=symbol, side=provisional_side, quantity=quantity, client_order_id=client_id)
                     if not order.ok:
                         self.log.error("%s ENTRY failed: %s", symbol, order.error)
                         # Libère le slot réservé car l'ordre a échoué
@@ -588,11 +648,23 @@ class SpotBot:
                         except Exception:
                             pass
 
-                        sl, tp = compute_sl_tp_prices(
+                        # ATR-like absolute move from price history in atr_window_sec
+                        atr_window = max(2, int(self.atr_window_sec / max(1, self.check_interval_sec)))
+                        diffs = []
+                        try:
+                            hist_list = list(self._price_history[symbol])
+                            for i in range(max(1, len(hist_list) - atr_window), len(hist_list)):
+                                if i > 0:
+                                    diffs.append(abs(hist_list[i][1] - hist_list[i - 1][1]))
+                            atr_abs = sum(diffs) / len(diffs) if diffs else entry_price * (self.stop_loss_percent / 100.0)
+                        except Exception:
+                            atr_abs = entry_price * (self.stop_loss_percent / 100.0)
+                        sl, tp = compute_atr_sl_tp(
                             entry_price=entry_price,
                             side=provisional_side,  # type: ignore[arg-type]
-                            stop_loss_percent=self.stop_loss_percent,
-                            take_profit_percent=self.take_profit_percent,
+                            atr_abs=atr_abs,
+                            alpha_sl=self.alpha_sl,
+                            beta_tp=self.beta_tp,
                         )
                         state.in_position = True
                         state.side = provisional_side
@@ -646,6 +718,12 @@ class SpotBot:
                 tick += 1
                 continue
 
+            # Always update volatility state while open
+            try:
+                ret_pct_open = (price - (state.last_price or price)) / (state.last_price or price) * 100.0
+                self._vol_state[symbol] = update_volatility_state(state=self._vol_state[symbol], ret=ret_pct_open, lambda_ewm=self.ewm_lambda)
+            except Exception:
+                pass
             # Manage open position: check SL/TP and exit if hit
             state.last_price = price
             exit_reason: Optional[str] = None
@@ -750,6 +828,23 @@ class SpotBot:
                         pnl=pnl,
                         reason=exit_reason,
                     )
+                    # Update daily loss and streaks
+                    try:
+                        self._day_pnl += pnl
+                        self._recent_outcomes[symbol].append("WIN" if pnl > 0 else "LOSS")
+                        if pnl > 0:
+                            self._consec_losses = 0
+                        else:
+                            self._consec_losses += 1
+                        # Apply caps
+                        if self.max_daily_loss_usdt and self._day_pnl <= -abs(self.max_daily_loss_usdt):
+                            self._cooloff_until = time.time() + max(self.cooloff_sec, 1800)
+                            self.log.warning("Daily loss cap reached: entering cool-off for %ss", int(self._cooloff_until - time.time()))
+                        if self.max_consecutive_losses and self._consec_losses >= self.max_consecutive_losses:
+                            self._cooloff_until = time.time() + max(self.cooloff_sec, 900)
+                            self.log.warning("Consecutive losses cap reached: entering cool-off for %ss", int(self._cooloff_until - time.time()))
+                    except Exception:
+                        pass
                     # Clear persistent state and mark cooldown
                     state.in_position = False
                     state.side = None
