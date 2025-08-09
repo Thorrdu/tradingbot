@@ -370,6 +370,29 @@ class PionexClient:
             params["endTime"] = int(end_time_ms)
         return self._signed_get(path, params)
 
+    def get_fills_by_order_id(self, symbol: str, order_id: str) -> ApiResponse:
+        """Get fills for a specific order id.
+
+        Docs: GET /api/v1/trade/fillsByOrderId (parameters: symbol, orderId)
+        Returns ApiResponse with { data: { fills: [...] } } on success.
+        """
+        path = "/api/v1/trade/fillsByOrderId"
+        params: Dict[str, Any] = {
+            "symbol": self._normalize_symbol(symbol),
+            "orderId": order_id,
+        }
+        return self._signed_get(path, params)
+
+    def get_balances(self) -> ApiResponse:
+        """Fetch account balances (trading account).
+
+        Docs: GET /api/v1/account/balances (Permission: Read)
+        Returns ApiResponse with { data: { balances: [ { coin, free, frozen } ] } }
+        """
+        path = "/api/v1/account/balances"
+        params: Dict[str, Any] = {}
+        return self._signed_get(path, params)
+
     def infer_position_from_fills(self, symbol: str, limit: int = 50) -> Dict[str, Any]:
         """Heuristic: compute net size from recent fills to estimate open position.
 

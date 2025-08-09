@@ -32,6 +32,7 @@ class SymbolState:
     # Signal confirmation helpers (not persisted):
     confirm_streak: int = 0
     last_signal_side: Optional[str] = None
+    entry_time: float = 0.0
 
 
 class SpotBot:
@@ -85,6 +86,9 @@ class SpotBot:
         self.check_interval_sec = int(self.config["check_interval_sec"])
         self.idle_backoff_sec = int(self.config.get("idle_backoff_sec", max(10, self.check_interval_sec * 6)))
         self.cooldown_sec = int(self.config["cooldown_sec"])
+        self.force_min_sell = bool(self.config.get("force_min_sell", True))
+        self.min_hold_sec = int(self.config.get("min_hold_sec", 10))
+        self.exit_hysteresis_percent = float(self.config.get("exit_hysteresis_percent", 0.05))
 
         self.logger = TradeLogger(self.config.get("log_csv", "trades.csv"))
         self.state_store = StateStore(self.config.get("state_file", "runtime_state.json"))
@@ -205,40 +209,63 @@ class SpotBot:
     def _round_quantity(self, quantity: float) -> float:
         return max(round(quantity, 6), 0.0)
 
-    def _normalize_spot_sell_quantity(self, symbol: str, quantity: float) -> float:
-        """Normalize sell size to exchange filters for SPOT market.
-
-        Uses minTradeDumping as the step and minimum for MARKET SELL, and maxTradeDumping as cap.
-        If minTradeDumping is absent, falls back to minTradeSize. As last resort, uses 6 decimals.
+    def _parse_spot_rules(self, symbol: str) -> Tuple[float, float, Optional[float]]:
+        """Return (step, min_dump, max_dump) for MARKET SELL from cached rules.
+        step is inferred from the decimals of minTradeDumping (or minTradeSize) when present.
         """
+        norm = self.client._normalize_symbol(symbol)
+        rules = self._spot_rules.get(norm) or {}
+        min_dump_str = rules.get("minTradeDumping") or rules.get("minTradeSize")
+        max_dump_str = rules.get("maxTradeDumping") or rules.get("maxTradeSize")
+        step = 10 ** (-6)
+        min_dump = 0.0
+        max_dump: Optional[float] = None
         try:
-            norm = self.client._normalize_symbol(symbol)
-            rules = self._spot_rules.get(norm) or {}
-            # Determine step and bounds from rules
-            min_dump_str = rules.get("minTradeDumping") or rules.get("minTradeSize")
-            max_dump_str = rules.get("maxTradeDumping") or rules.get("maxTradeSize")
-            step: float
             if isinstance(min_dump_str, str) and min_dump_str.strip() != "":
                 min_dump = float(min_dump_str)
-                # Step is inferred from decimal places of min_dump
-                # Example: 0.000001 -> step=1e-6, 1 -> step=1
-                s = min_dump_str
-                if "." in s:
-                    decimals = len(s.split(".")[-1])
+                if "." in min_dump_str:
+                    decimals = len(min_dump_str.split(".")[-1])
                 else:
                     decimals = 0
                 step = 10 ** (-decimals)
-            else:
-                # Fallback when rules missing
-                min_dump = 0.0
-                step = 10 ** (-6)
+            if isinstance(max_dump_str, str) and max_dump_str.strip() != "":
+                max_dump = float(max_dump_str)
+        except Exception:
+            pass
+        return (step, min_dump, max_dump)
 
-            # Floor to the nearest step
+    def _get_free_base_balance(self, symbol: str) -> float:
+        try:
+            norm = self.client._normalize_symbol(symbol)
+            base = norm.split("_")[0]
+            resp = self.client.get_balances()
+            if not resp.ok or not resp.data:
+                return 0.0
+            balances = resp.data.get("data", {}).get("balances", []) if isinstance(resp.data, dict) else []
+            for b in balances:
+                if isinstance(b, dict) and str(b.get("coin", "")).upper() == base.upper():
+                    return float(b.get("free", 0.0))
+        except Exception:
+            return 0.0
+        return 0.0
+
+    def _normalize_spot_sell_quantity(self, symbol: str, quantity: float, *, free_balance: float, force_min_if_possible: bool) -> float:
+        """Normalize sell size to exchange filters for SPOT market.
+
+        Uses minTradeDumping as step and minimum for MARKET SELL, and maxTradeDumping as cap.
+        Caps by free balance. If floored<min but free>=min and force_min_if_possible, returns min.
+        If still <min, returns 0.0 (skip).
+        """
+        try:
+            step, min_dump, max_dump = self._parse_spot_rules(symbol)
+            # cap by free balance
+            capped = min(quantity, max(free_balance, 0.0))
+            # floor to step
             if step > 0:
-                floored = (int(quantity / step)) * step
+                floored = (int(capped / step)) * step
             else:
-                floored = quantity
-            # Numeric stability: round to step decimals
+                floored = capped
+            # round to step decimals
             if step >= 1:
                 floored = float(int(floored))
             else:
@@ -246,19 +273,18 @@ class SpotBot:
                 decimals = int(round(-math.log10(step)))
                 floored = round(floored, decimals)
 
-            # Enforce min and max
             if floored < max(min_dump, 0.0):
-                return 0.0
-            if isinstance(max_dump_str, str) and max_dump_str.strip() != "":
-                try:
-                    max_dump = float(max_dump_str)
-                    if floored > max_dump:
-                        floored = max_dump
-                except Exception:
-                    pass
+                # if we can sell exactly min_dump within free balance and feature enabled
+                if force_min_if_possible and free_balance >= min_dump and min_dump > 0:
+                    floored = min_dump
+                else:
+                    return 0.0
+
+            if max_dump is not None and floored > max_dump:
+                floored = max_dump
             return max(floored, 0.0)
         except Exception:
-            q = self._round_quantity(quantity)
+            q = self._round_quantity(min(quantity, max(free_balance, 0.0)))
             return q if q > 0 else 0.0
 
     def _worker(self, symbol: str) -> None:
@@ -360,7 +386,8 @@ class SpotBot:
                 )
 
                 should_enter = provisional_side is not None and state.confirm_streak >= self.breakout_confirm_ticks
-                if should_enter and provisional_side:
+                # For SPOT, only BUY opens a position. SELL is handled by exit logic.
+                if should_enter and provisional_side == "BUY":
                     # Per-symbol cap first
                     if not self._try_reserve_symbol_slot(symbol):
                         state.last_price = price
@@ -399,20 +426,43 @@ class SpotBot:
                         self._on_close()
                         self._release_symbol_slot(symbol)
                     else:
-                        # Determine actual entry quantity and price
+                        # Determine actual entry quantity and price using fills if possible
                         entry_price = price
                         entry_qty = quantity if provisional_side == "SELL" else self._round_quantity(self.position_usdt / price)
                         try:
                             # In live mode, refine using fills if available
                             if not bool(self.config.get("dry_run", True)):
-                                inferred = self.client.infer_position_from_fills(symbol)
-                                if inferred.get("in_position") and inferred.get("side") == provisional_side:
-                                    q = float(inferred.get("quantity", entry_qty))
-                                    px = float(inferred.get("entry_price", entry_price))
-                                    if q > 0:
-                                        entry_qty = self._round_quantity(q)
-                                    if px > 0:
-                                        entry_price = px
+                                # Prefer fills by the just-created order id if available
+                                created_order_id = (order.data or {}).get("orderId") if hasattr(order, "data") else None
+                                if created_order_id:
+                                    fills_resp = self.client.get_fills_by_order_id(symbol, created_order_id)
+                                    if fills_resp.ok and fills_resp.data:
+                                        data = fills_resp.data.get("data") if isinstance(fills_resp.data, dict) else None
+                                        fills = data.get("fills") if isinstance(data, dict) else None
+                                        if isinstance(fills, list) and fills:
+                                            qty_sum = 0.0
+                                            notional = 0.0
+                                            for f in fills:
+                                                try:
+                                                    qf = float(f.get("size", 0.0))
+                                                    pf = float(f.get("price", 0.0))
+                                                except Exception:
+                                                    qf = 0.0
+                                                    pf = 0.0
+                                                qty_sum += qf
+                                                notional += qf * pf
+                                            if qty_sum > 0:
+                                                entry_qty = self._round_quantity(qty_sum)
+                                                entry_price = notional / qty_sum
+                                else:
+                                    inferred = self.client.infer_position_from_fills(symbol)
+                                    if inferred.get("in_position") and inferred.get("side") == provisional_side:
+                                        q = float(inferred.get("quantity", entry_qty))
+                                        px = float(inferred.get("entry_price", entry_price))
+                                        if q > 0:
+                                            entry_qty = self._round_quantity(q)
+                                        if px > 0:
+                                            entry_price = px
                         except Exception:
                             pass
 
@@ -429,6 +479,7 @@ class SpotBot:
                         state.stop_loss = sl
                         state.take_profit = tp
                         state.order_id = (order.data or {}).get("orderId") if hasattr(order, "data") else None
+                        state.entry_time = time.time()
                         state.confirm_streak = 0
                         state.last_signal_side = None
                         # Le slot global et le slot symbole sont déjà réservés, ne pas ré-incrémenter
@@ -466,9 +517,16 @@ class SpotBot:
             state.last_price = price
             exit_reason: Optional[str] = None
             if state.side == "BUY":
-                if price <= state.stop_loss:
+                # Apply hysteresis and min hold
+                if (time.time() - state.entry_time) >= self.min_hold_sec:
+                    sl_trigger = state.stop_loss * (1.0 - self.exit_hysteresis_percent / 100.0)
+                    tp_trigger = state.take_profit * (1.0 + self.exit_hysteresis_percent / 100.0)
+                else:
+                    sl_trigger = 0.0  # disable
+                    tp_trigger = float("inf")  # disable
+                if price <= sl_trigger:
                     exit_reason = "SL"
-                elif price >= state.take_profit:
+                elif price >= tp_trigger:
                     exit_reason = "TP"
             elif state.side == "SELL":
                 if price >= state.stop_loss:
@@ -500,9 +558,10 @@ class SpotBot:
 
             if exit_reason is not None:
                 self.log.info("%s EXIT trigger: reason=%s price=%.8f side=%s", symbol, exit_reason, price, state.side)
-                sell_qty = self._normalize_spot_sell_quantity(symbol, state.quantity)
+                free_bal = self._get_free_base_balance(symbol)
+                sell_qty = self._normalize_spot_sell_quantity(symbol, state.quantity, free_balance=free_bal, force_min_if_possible=self.force_min_sell)
                 if sell_qty <= 0:
-                    self.log.error("%s EXIT %s skipped: size below minTradeDumping or precision step (qty=%.8f)", symbol, exit_reason, state.quantity)
+                    self.log.error("%s EXIT %s skipped: qty below rules or balance (qty=%.8f free=%.8f)", symbol, exit_reason, state.quantity, free_bal)
                     time.sleep(self.check_interval_sec)
                     tick += 1
                     continue
