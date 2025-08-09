@@ -205,3 +205,7 @@ trading/
     run.ps1
     run.sh
 ```
+
+## Support
+
+If this project is helpful, you can support me on Ko‑fi: [ko-fi.com/thorrdu](https://ko-fi.com/thorrdu).
