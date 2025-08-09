@@ -208,20 +208,54 @@ class SpotBot:
     def _normalize_spot_sell_quantity(self, symbol: str, quantity: float) -> float:
         """Normalize sell size to exchange filters for SPOT market.
 
-        Uses amountPrecision (decimal places) and minTradeDumping (min market sell qty).
-        Falls back to 6 decimals if not available.
+        Uses minTradeDumping as the step and minimum for MARKET SELL, and maxTradeDumping as cap.
+        If minTradeDumping is absent, falls back to minTradeSize. As last resort, uses 6 decimals.
         """
         try:
             norm = self.client._normalize_symbol(symbol)
             rules = self._spot_rules.get(norm) or {}
-            amount_precision = int(rules.get("amountPrecision", 6))
-            min_dump = float(rules.get("minTradeDumping", 0.0)) if rules.get("minTradeDumping") is not None else 0.0
-            step = 10 ** (-amount_precision)
-            # floor to step
-            floored = (int(quantity / step)) * step
-            floored = round(floored, amount_precision)
-            if floored < min_dump:
+            # Determine step and bounds from rules
+            min_dump_str = rules.get("minTradeDumping") or rules.get("minTradeSize")
+            max_dump_str = rules.get("maxTradeDumping") or rules.get("maxTradeSize")
+            step: float
+            if isinstance(min_dump_str, str) and min_dump_str.strip() != "":
+                min_dump = float(min_dump_str)
+                # Step is inferred from decimal places of min_dump
+                # Example: 0.000001 -> step=1e-6, 1 -> step=1
+                s = min_dump_str
+                if "." in s:
+                    decimals = len(s.split(".")[-1])
+                else:
+                    decimals = 0
+                step = 10 ** (-decimals)
+            else:
+                # Fallback when rules missing
+                min_dump = 0.0
+                step = 10 ** (-6)
+
+            # Floor to the nearest step
+            if step > 0:
+                floored = (int(quantity / step)) * step
+            else:
+                floored = quantity
+            # Numeric stability: round to step decimals
+            if step >= 1:
+                floored = float(int(floored))
+            else:
+                import math
+                decimals = int(round(-math.log10(step)))
+                floored = round(floored, decimals)
+
+            # Enforce min and max
+            if floored < max(min_dump, 0.0):
                 return 0.0
+            if isinstance(max_dump_str, str) and max_dump_str.strip() != "":
+                try:
+                    max_dump = float(max_dump_str)
+                    if floored > max_dump:
+                        floored = max_dump
+                except Exception:
+                    pass
             return max(floored, 0.0)
         except Exception:
             q = self._round_quantity(quantity)
