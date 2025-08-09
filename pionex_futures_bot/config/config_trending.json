@@ -1,13 +1,13 @@
 {
   "base_url": "https://api.pionex.com",
   "symbols": [
-    "BTC_USDT",
-    "ETH_USDT",
     "SOL_USDT",
-    "BNB_USDT",
-    "XRP_USDT",
-    "DOGE_USDT",
-    "TON_USDT"
+    "TON_USDT",
+    "POL_USDT",
+    "NEAR_USDT",
+    "SEI_USDT",
+    "SUI_USDT",
+    "DOGE_USDT"
   ],
   "leverage": 3,
   "position_usdt": 30,
@@ -22,7 +22,8 @@
   "cooldown_sec": 300,
   "idle_backoff_sec": 24,
   "dry_run": false,
-  "log_csv": "logs/trades.csv",
-  "state_file": "logs/runtime_state.json"
+  "log_csv": "logs/trades_trending.csv",
+  "state_file": "logs/runtime_state_trending.json"
 }
+
 
