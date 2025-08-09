@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, Optional, Deque, Tuple
 from collections import deque
 import logging
+from logging.handlers import TimedRotatingFileHandler
 
 from dotenv import load_dotenv
 
@@ -60,6 +61,21 @@ class PerpBot:
             base_url=self.config["base_url"],
             dry_run=bool(self.config.get("dry_run", True)),
         )
+
+        # File logging into logs/ directory
+        try:
+            logs_dir = Path(self.config.get("log_dir", "logs"))
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            log_file = logs_dir / ("perp_bot_dryrun.log" if bool(self.config.get("dry_run", True)) else "perp_bot.log")
+            fh = TimedRotatingFileHandler(str(log_file), when="midnight", backupCount=7, encoding="utf-8")
+            fh.setFormatter(logging.Formatter(
+                fmt="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            ))
+            if not any(isinstance(h, TimedRotatingFileHandler) and getattr(h, 'baseFilename', '') == fh.baseFilename for h in self.log.handlers):
+                self.log.addHandler(fh)
+        except Exception:
+            pass
 
         self.symbols = list(self.config["symbols"])  # symbols like BTCUSDT, normalized to *_PERP
         # Optional: validate symbols against cached list if present

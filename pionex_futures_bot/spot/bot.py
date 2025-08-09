@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Optional, Deque, Tuple, Any
 from collections import deque
 import logging
+from logging.handlers import TimedRotatingFileHandler
 
 from dotenv import load_dotenv
 
@@ -59,6 +60,23 @@ class SpotBot:
             base_url=self.config["base_url"],
             dry_run=bool(self.config.get("dry_run", True)),
         )
+
+        # File logging into logs/ directory
+        try:
+            logs_dir = Path(self.config.get("log_dir", "logs"))
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            log_file = logs_dir / ("bot_dryrun.log" if bool(self.config.get("dry_run", True)) else "bot.log")
+            fh = TimedRotatingFileHandler(str(log_file), when="midnight", backupCount=7, encoding="utf-8")
+            fh.setFormatter(logging.Formatter(
+                fmt="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            ))
+            # Avoid duplicate addition on hot-reload
+            if not any(isinstance(h, TimedRotatingFileHandler) and getattr(h, 'baseFilename', '') == fh.baseFilename for h in self.log.handlers):
+                self.log.addHandler(fh)
+        except Exception:
+            # If file handler fails, we continue with console logging only
+            pass
 
         self.symbols = list(self.config["symbols"])  # copy
         # Optional: validate symbols against cached list if present
@@ -192,6 +210,20 @@ class SpotBot:
             self.force_min_sell,
             self.max_open_trades_per_symbol,
         )
+
+    def _format_duration(self, seconds: float) -> str:
+        try:
+            s = max(0.0, float(seconds))
+            total = int(round(s))
+            hours, rem = divmod(total, 3600)
+            minutes, secs = divmod(rem, 60)
+            if hours > 0:
+                return f"{hours}h{minutes:02}m{secs:02}s"
+            if minutes > 0:
+                return f"{minutes}m{secs:02}s"
+            return f"{s:.1f}s"
+        except Exception:
+            return f"{seconds}s"
 
     def _can_open_more(self) -> bool:
         with self._open_trades_lock:
@@ -564,7 +596,7 @@ class SpotBot:
                 hit_sl_dbg = price <= sl_trigger
                 hit_tp_dbg = price >= tp_trigger
                 self.log.debug(
-                    "%s open: price=%.8f entry=%.8f sl=%.8f tp=%.8f sl_trig=%.8f tp_trig=%.8f hold=%.1fs/%ss hit_sl=%s hit_tp=%s",
+                    "%s open: price=%.8f entry=%.8f sl=%.8f tp=%.8f sl_trig=%.8f tp_trig=%.8f hold=%s/%s hit_sl=%s hit_tp=%s",
                     symbol,
                     price,
                     state.entry_price,
@@ -572,8 +604,8 @@ class SpotBot:
                     state.take_profit,
                     sl_trigger,
                     tp_trigger,
-                    elapsed,
-                    self.min_hold_sec,
+                    self._format_duration(elapsed),
+                    self._format_duration(float(self.min_hold_sec)),
                     hit_sl_dbg,
                     hit_tp_dbg,
                 )
