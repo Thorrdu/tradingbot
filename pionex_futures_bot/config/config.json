@@ -40,6 +40,8 @@
   "force_min_sell": true,
   "sweep_dust_on_start": false,
   "sweep_dust_heartbeat_sec": 900,
+  "buy_align_step": true,
+  "buy_align_bias_bps": 5.0,
   "max_daily_loss_usdt": 5,
   "max_consecutive_losses": 3,
   "cooloff_sec": 1800,

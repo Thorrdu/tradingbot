@@ -166,6 +166,9 @@ class SpotBot:
         self.trailing_atr_mult = float(self.config.get("trailing_atr_mult", 1.0))
         self.tp_pullback_confirm = bool(self.config.get("tp_pullback_confirm", True))
         self.tp_pullback_retrace_percent = float(self.config.get("tp_pullback_retrace_percent", 0.15))
+        # Buy alignment to step to reduce sell dust
+        self.buy_align_step = bool(self.config.get("buy_align_step", True))
+        self.buy_align_bias_bps = float(self.config.get("buy_align_bias_bps", 5.0))
         # Risk control
         self.max_daily_loss_usdt = float(self.config.get("max_daily_loss_usdt", 0.0))  # 0 disables
         self.max_consecutive_losses = int(self.config.get("max_consecutive_losses", 0))  # 0 disables
@@ -715,6 +718,33 @@ class SpotBot:
                         except Exception:
                             min_amount = None
                         buy_amount = max(self.position_usdt, min_amount or 0.0)
+                        if self.buy_align_step:
+                            try:
+                                step, min_dump, _ = self._parse_spot_rules(symbol)
+                                # Target quantity aligned to step
+                                qty_raw = self.position_usdt / price if price > 0 else 0.0
+                                if step > 0 and qty_raw > 0:
+                                    import math
+                                    qty_target = math.floor(qty_raw / step) * step
+                                    if qty_target < max(min_dump, step):
+                                        qty_target = max(min_dump, step)
+                                    # Bias the amount downward slightly to avoid overshoot due to slippage
+                                    bias = max(0.0, self.buy_align_bias_bps) / 10000.0
+                                    aligned_amount = qty_target * price * (1.0 - bias)
+                                    if min_amount is not None:
+                                        aligned_amount = max(aligned_amount, min_amount)
+                                    if aligned_amount > 0:
+                                        buy_amount = aligned_amount
+                                        self.log.debug(
+                                            "%s BUY align: qty_raw=%.8f qty_target=%.8f step=%.g amount=%.6f",
+                                            symbol,
+                                            qty_raw,
+                                            qty_target,
+                                            step,
+                                            buy_amount,
+                                        )
+                            except Exception:
+                                pass
                         order = self.client.place_market_order(symbol=symbol, side=provisional_side, amount=buy_amount, client_order_id=client_id)
                     else:
                         order = self.client.place_market_order(symbol=symbol, side=provisional_side, quantity=quantity, client_order_id=client_id)
