@@ -65,6 +65,7 @@ class SymbolState:
     confirm_streak: int = 0
     last_signal_side: Optional[str] = None
     entry_time: float = 0.0
+    max_price_since_entry: float = 0.0
 
 
 class SpotBot:
@@ -147,6 +148,13 @@ class SpotBot:
         self.atr_window_sec = int(self.config.get("atr_window_sec", 300))
         self.alpha_sl = float(self.config.get("alpha_sl", 1.8))
         self.beta_tp = float(self.config.get("beta_tp", 2.6))
+        # Trailing / pullback
+        self.trailing_enabled = bool(self.config.get("trailing_enabled", True))
+        self.trailing_activation_gain_percent = float(self.config.get("trailing_activation_gain_percent", 1.0))
+        self.trailing_retrace_percent = float(self.config.get("trailing_retrace_percent", 0.20))
+        self.trailing_atr_mult = float(self.config.get("trailing_atr_mult", 1.0))
+        self.tp_pullback_confirm = bool(self.config.get("tp_pullback_confirm", True))
+        self.tp_pullback_retrace_percent = float(self.config.get("tp_pullback_retrace_percent", 0.15))
         # Risk control
         self.max_daily_loss_usdt = float(self.config.get("max_daily_loss_usdt", 0.0))  # 0 disables
         self.max_consecutive_losses = int(self.config.get("max_consecutive_losses", 0))  # 0 disables
@@ -681,6 +689,7 @@ class SpotBot:
                         state.take_profit = tp
                         state.order_id = (order.data or {}).get("orderId") if hasattr(order, "data") else None
                         state.entry_time = time.time()
+                        state.max_price_since_entry = entry_price
                         state.confirm_streak = 0
                         state.last_signal_side = None
                         # Le slot global et le slot symbole sont déjà réservés, ne pas ré-incrémenter
@@ -760,10 +769,52 @@ class SpotBot:
                     hit_sl_dbg,
                     hit_tp_dbg,
                 )
+                # Track max price since entry
+                try:
+                    if price > 0:
+                        state.max_price_since_entry = max(state.max_price_since_entry or state.entry_price, price)
+                except Exception:
+                    pass
+                # Optional trailing/pullback logic
+                if self.trailing_enabled and elapsed >= self.min_hold_sec and (state.max_price_since_entry > state.entry_price):
+                    gain_pct_from_entry = (state.max_price_since_entry - state.entry_price) / state.entry_price * 100.0
+                    if gain_pct_from_entry >= self.trailing_activation_gain_percent:
+                        # Compute ATR-like absolute
+                        atr_window = max(2, int(self.atr_window_sec / max(1, self.check_interval_sec)))
+                        diffs = []
+                        try:
+                            hist_list = list(self._price_history[symbol])
+                            for i in range(max(1, len(hist_list) - atr_window), len(hist_list)):
+                                if i > 0:
+                                    diffs.append(abs(hist_list[i][1] - hist_list[i - 1][1]))
+                            atr_abs_cur = (sum(diffs) / len(diffs)) if diffs else (state.entry_price * (self.stop_loss_percent / 100.0))
+                        except Exception:
+                            atr_abs_cur = state.entry_price * (self.stop_loss_percent / 100.0)
+                        trailing_stop_pullback = state.max_price_since_entry * (1.0 - self.trailing_retrace_percent / 100.0)
+                        trailing_stop_atr = state.max_price_since_entry - self.trailing_atr_mult * atr_abs_cur
+                        trailing_stop = max(trailing_stop_pullback, trailing_stop_atr)
+                        if price <= trailing_stop and exit_reason is None:
+                            exit_reason = "TRAIL"
+                            self.log.info(
+                                "%s TRAIL trigger: max=%.8f trail=%.8f price=%.8f gain=%.4f%%",
+                                symbol,
+                                state.max_price_since_entry,
+                                trailing_stop,
+                                price,
+                                gain_pct_from_entry,
+                            )
                 if price <= sl_trigger:
                     exit_reason = "SL"
                 elif price >= tp_trigger:
-                    exit_reason = "TP"
+                    if self.tp_pullback_confirm and (state.max_price_since_entry > 0):
+                        retrace_pct = (state.max_price_since_entry - price) / state.max_price_since_entry * 100.0
+                        if retrace_pct >= self.tp_pullback_retrace_percent:
+                            exit_reason = "TP"
+                        else:
+                            # wait for pullback confirmation
+                            pass
+                    else:
+                        exit_reason = "TP"
             elif state.side == "SELL":
                 if price >= state.stop_loss:
                     exit_reason = "SL"
