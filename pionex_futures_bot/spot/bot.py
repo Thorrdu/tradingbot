@@ -492,6 +492,17 @@ class SpotBot:
         norm = self.client._normalize_symbol(symbol)
         rules_map = getattr(self, "_spot_rules", {}) or {}
         rules = rules_map.get(norm) or {}
+        # If rules are missing or incomplete, fetch on-demand from API and cache
+        try:
+            needs_fetch = not isinstance(rules, dict) or ("basePrecision" not in rules and not rules.get("minTradeDumping") and not rules.get("minTradeSize"))
+            if needs_fetch:
+                resp = self.client.get_market_symbols(market_type="SPOT", symbols=[norm])
+                if resp.ok and resp.data and isinstance(resp.data.get("symbols"), list) and resp.data["symbols"]:
+                    rules = resp.data["symbols"][0]
+                    self._spot_rules[norm] = rules  # cache
+                    self.log.info("%s rules refreshed from API", norm)
+        except Exception:
+            pass
         min_dump_str = rules.get("minTradeDumping") or rules.get("minTradeSize")
         max_dump_str = rules.get("maxTradeDumping") or rules.get("maxTradeSize")
         # Default fine step
@@ -1164,9 +1175,19 @@ class SpotBot:
                     min_dump,
                     ("%.8f" % max_dump) if (max_dump is not None) else "None",
                 )
+                # Attempt SELL with retry by stepping down one step if filter denied
                 close_resp = self.client.close_position(symbol=symbol, side=state.side or "BUY", quantity=sell_qty)
                 if not close_resp.ok:
-                    self.log.error("%s EXIT %s failed: %s", symbol, exit_reason, close_resp.error)
+                    err = str(getattr(close_resp, "error", ""))
+                    if "SIZE_FILTER_DENIED" in err or "size filter" in err.lower():
+                        # Try reduce by one step
+                        step, _, _ = self._parse_spot_rules(symbol)
+                        retry_qty = max(0.0, sell_qty - max(step, 0.0))
+                        if retry_qty > 0:
+                            self.log.warning("%s EXIT %s retry with reduced size: %.8f -> %.8f", symbol, exit_reason, sell_qty, retry_qty)
+                            close_resp = self.client.close_position(symbol=symbol, side=state.side or "BUY", quantity=retry_qty)
+                    if not close_resp.ok:
+                        self.log.error("%s EXIT %s failed: %s", symbol, exit_reason, close_resp.error)
                 else:
                     pnl = 0.0
                     try:
