@@ -643,6 +643,65 @@ class SpotBot:
         except Exception:
             pass
 
+    def _finalize_close(self, symbol: str, state: SymbolState, price: float, reason: str) -> None:
+        try:
+            pnl = 0.0
+            if (state.side or "BUY") == "BUY":
+                pnl = (price - state.entry_price) * state.quantity
+            else:
+                pnl = (state.entry_price - price) * state.quantity
+        except Exception:
+            pnl = 0.0
+        # Log and persist
+        try:
+            self.logger.log(
+                event=f"EXIT_{reason}",
+                symbol=symbol,
+                side=state.side,
+                quantity=state.quantity,
+                price=price,
+                order_id=None,
+                pnl=pnl,
+                reason=reason,
+            )
+            pnl_percent = ((price - state.entry_price) / state.entry_price * 100.0) if (state.side == "BUY") else ((state.entry_price - price) / state.entry_price * 100.0)
+            self.summary_logger.log_result(
+                symbol=symbol,
+                side=state.side,
+                quantity=state.quantity,
+                executed_qty=state.quantity,
+                residual_qty=0.0,
+                entry_price=state.entry_price,
+                exit_price=price,
+                entry_time=state.entry_time,
+                exit_time=time.time(),
+                pnl_usdt=pnl,
+                pnl_percent=pnl_percent,
+                exit_reason=reason,
+                meta={
+                    "mode": self.signal_mode,
+                },
+            )
+        except Exception:
+            pass
+        # Clear state
+        state.in_position = False
+        state.side = None
+        state.quantity = 0.0
+        state.entry_price = 0.0
+        state.stop_loss = 0.0
+        state.take_profit = 0.0
+        state.order_id = None
+        state.last_exit_time = time.time()
+        state.entry_time = 0.0
+        with self._open_trades_lock:
+            if self._open_trades_count > 0:
+                self._open_trades_count -= 1
+            current = self._symbol_open_count.get(symbol, 0)
+            if current > 0:
+                self._symbol_open_count[symbol] = current - 1
+        self.state_store.clear_symbol(symbol)
+
     def _parse_spot_buy_rules(self, symbol: str) -> Tuple[int, float]:
         """Return (amount_precision, min_amount_usdt) for MARKET BUY."""
         try:
@@ -1186,8 +1245,15 @@ class SpotBot:
                         if retry_qty > 0:
                             self.log.warning("%s EXIT %s retry with reduced size: %.8f -> %.8f", symbol, exit_reason, sell_qty, retry_qty)
                             close_resp = self.client.close_position(symbol=symbol, side=state.side or "BUY", quantity=retry_qty)
-                    if not close_resp.ok:
-                        self.log.error("%s EXIT %s failed: %s", symbol, exit_reason, close_resp.error)
+                if not close_resp.ok:
+                    self.log.error("%s EXIT %s failed: %s", symbol, exit_reason, close_resp.error)
+                    # Fallback finalize to break loop and clean state
+                    self._finalize_close(symbol, state, price, exit_reason + "_LOCAL")
+                    self._on_close()
+                    self._release_symbol_slot(symbol)
+                    time.sleep(self.check_interval_sec)
+                    tick += 1
+                    continue
                 else:
                     pnl = 0.0
                     try:
