@@ -567,6 +567,71 @@ class SpotBot:
             return 0.0
         return 0.0
 
+    def _try_resume_symbol(self, symbol: str) -> None:
+        """Best-effort resume for a single symbol inside worker, in case init resume missed."""
+        try:
+            st = self._states[symbol]
+            if st.in_position:
+                return
+            # Load primary and alternates
+            primary_state_path = Path(self.config.get("state_file", "logs/runtime_state.json"))
+            from pionex_futures_bot.common.state_store import StateStore as _SS
+            snapshots: list[dict] = []
+            for p in [primary_state_path, Path("logs/runtime_state.json"), Path("logs/runtime_state_trending.json")]:
+                try:
+                    if p.exists():
+                        data = _SS(p).load()
+                        if isinstance(data, dict):
+                            snapshots.append(data)
+                except Exception:
+                    continue
+            # Key variants
+            keys = [symbol]
+            try:
+                keys.append(self.client._normalize_symbol(symbol))
+                keys.append(symbol.replace("_", ""))
+                keys.append(self.client._normalize_symbol(symbol).replace("_", ""))
+            except Exception:
+                pass
+            found = None
+            for snap in snapshots:
+                for k in keys:
+                    if k in snap and isinstance(snap[k], dict):
+                        found = snap[k]
+                        break
+                if found:
+                    break
+            if not found:
+                return
+            # Apply
+            st.in_position = bool(found.get("in_position", False))
+            if not st.in_position:
+                return
+            st.side = found.get("side")
+            try:
+                st.quantity = float(found.get("quantity", 0.0))
+                st.entry_price = float(found.get("entry_price", 0.0))
+                st.stop_loss = float(found.get("stop_loss", 0.0))
+                st.take_profit = float(found.get("take_profit", 0.0))
+                st.last_exit_time = float(found.get("last_exit_time", 0.0))
+                st.entry_time = float(found.get("entry_time", 0.0))
+            except Exception:
+                pass
+            with self._open_trades_lock:
+                self._open_trades_count += 1
+                self._symbol_open_count[symbol] = self._symbol_open_count.get(symbol, 0) + 1
+            self.log.info(
+                "%s resume(worker): in_position side=%s qty=%.6f entry=%.8f sl=%.8f tp=%.8f",
+                symbol,
+                st.side,
+                st.quantity,
+                st.entry_price,
+                st.stop_loss,
+                st.take_profit,
+            )
+        except Exception:
+            pass
+
     def _parse_spot_buy_rules(self, symbol: str) -> Tuple[int, float]:
         """Return (amount_precision, min_amount_usdt) for MARKET BUY."""
         try:
@@ -673,6 +738,9 @@ class SpotBot:
             else:
                 self.log.warning("%s price init failed: %s", symbol, getattr(resp, "error", None))
                 time.sleep(1)
+
+        # One more best-effort resume for this symbol
+        self._try_resume_symbol(symbol)
 
         tick = 0
         heartbeat_every = max(1, int(60 / max(1, self.check_interval_sec)))
