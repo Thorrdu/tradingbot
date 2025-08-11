@@ -12,7 +12,7 @@
     ],
     "leverage": 1,
     "position_usdt": 25,
-    "max_open_trades": 6,
+    "max_open_trades": 5,
     "max_open_trades_per_symbol": 1,
     "breakout_change_percent": 0.35,
     "mode": "contrarian",
