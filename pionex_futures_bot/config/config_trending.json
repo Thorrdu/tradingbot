@@ -11,7 +11,7 @@
     "XRP_USDT"
   ],
   "leverage": 1,
-  "position_usdt": 20,
+  "position_usdt": 25,
   "max_open_trades": 4,
   "max_open_trades_per_symbol": 1,
   "breakout_change_percent": 0.30,
