@@ -173,19 +173,43 @@ def main() -> None:
             return f"{s:.1f}s"
         avg_hold = hold_sum / n if n else 0.0
         win_rate = (n_win / n * 100.0) if n else 0.0
-        print("=== Trading statistics ===")
-        print(f"File: {csv_path}")
-        if args.symbol:
-            print(f"Symbol: {args.symbol}")
-        if since_dt:
-            print(f"Since: last {args.since_hours}h (>= {since_dt.isoformat()}Z)")
-        print(f"Trades: {n}  |  Wins: {n_win}  Losses: {n_loss}  BE: {n_be}  |  Win rate: {win_rate:.2f}%")
-        print(f"Total PnL: {total:.4f} USDT  |  Won: {won:.4f}  Lost: -{lost:.4f}")
-        print(f"Average hold: {fmt_dur(avg_hold)}")
-        if by_reason:
-            print("By reason:")
-            for k, v in sorted(by_reason.items(), key=lambda kv: (-kv[1], kv[0])):
-                print(f"  {k}: {v}")
+        try:
+            from rich.console import Console
+            from rich.table import Table
+            from rich.panel import Panel
+            console = Console()
+            console.print(Panel.fit("Trading statistics", style="bold cyan"))
+            meta_tbl = Table(box=None, show_header=False)
+            meta_tbl.add_row("File", str(csv_path))
+            if args.symbol:
+                meta_tbl.add_row("Symbol", str(args.symbol))
+            if since_dt:
+                meta_tbl.add_row("Since", f"last {args.since_hours}h (>= {since_dt.isoformat()}Z)")
+            meta_tbl.add_row("Trades", f"{n}  |  Wins: {n_win}  Losses: {n_loss}  BE: {n_be}  |  Win rate: {win_rate:.2f}%")
+            meta_tbl.add_row("PnL", f"Total {total:.4f} USDT  |  Won: {won:.4f}  Lost: -{lost:.4f}")
+            meta_tbl.add_row("Avg hold", f"{fmt_dur(avg_hold)}")
+            console.print(meta_tbl)
+            if by_reason:
+                tbl = Table(title="By exit reason", show_header=True, header_style="bold magenta")
+                tbl.add_column("Reason")
+                tbl.add_column("Count", justify="right")
+                for k, v in sorted(by_reason.items(), key=lambda kv: (-kv[1], kv[0])):
+                    tbl.add_row(k, str(v))
+                console.print(tbl)
+        except Exception:
+            print("=== Trading statistics ===")
+            print(f"File: {csv_path}")
+            if args.symbol:
+                print(f"Symbol: {args.symbol}")
+            if since_dt:
+                print(f"Since: last {args.since_hours}h (>= {since_dt.isoformat()}Z)")
+            print(f"Trades: {n}  |  Wins: {n_win}  Losses: {n_loss}  BE: {n_be}  |  Win rate: {win_rate:.2f}%")
+            print(f"Total PnL: {total:.4f} USDT  |  Won: {won:.4f}  Lost: -{lost:.4f}")
+            print(f"Average hold: {fmt_dur(avg_hold)}")
+            if by_reason:
+                print("By reason:")
+                for k, v in sorted(by_reason.items(), key=lambda kv: (-kv[1], kv[0])):
+                    print(f"  {k}: {v}")
         # Leaderboards by symbol
         if by_symbol:
             rows = []
@@ -195,18 +219,28 @@ def main() -> None:
                 pnl_sum = float(agg.get("pnl", 0))
                 wr = (w / t * 100.0) if t else 0.0
                 rows.append((s, t, wr, pnl_sum))
-            # Sorts
             top_n = max(1, int(args.top))
-            print("Top by PnL:")
-            for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (-x[3], x[0]))[:top_n]:
-                print(f"  {s}: pnl={pnl_sum:.4f} USDT | trades={t} | winrate={wr:.2f}%")
-            print("Bottom by PnL:")
-            for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (x[3], x[0]))[:top_n]:
-                print(f"  {s}: pnl={pnl_sum:.4f} USDT | trades={t} | winrate={wr:.2f}%")
-            print("Top by Winrate (min 3 trades):")
-            filt = [r for r in rows if r[1] >= 3]
-            for s, t, wr, pnl_sum in sorted(filt, key=lambda x: (-x[2], -x[3], x[0]))[:top_n]:
-                print(f"  {s}: winrate={wr:.2f}% | trades={t} | pnl={pnl_sum:.4f} USDT")
+            try:
+                from rich.table import Table
+                from rich.console import Console
+                console = Console()
+                tbl = Table(title=f"Top {top_n} / Bottom {top_n} by PnL", show_header=True, header_style="bold green")
+                tbl.add_column("Symbol")
+                tbl.add_column("Trades", justify="right")
+                tbl.add_column("Winrate", justify="right")
+                tbl.add_column("PnL (USDT)", justify="right")
+                for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (-x[3], x[0]))[:top_n]:
+                    tbl.add_row(s, str(t), f"{wr:.2f}%", f"{pnl_sum:.4f}")
+                for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (x[3], x[0]))[:top_n]:
+                    tbl.add_row(s, str(t), f"{wr:.2f}%", f"{pnl_sum:.4f}")
+                console.print(tbl)
+            except Exception:
+                print("Top by PnL:")
+                for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (-x[3], x[0]))[:top_n]:
+                    print(f"  {s}: pnl={pnl_sum:.4f} USDT | trades={t} | winrate={wr:.2f}%")
+                print("Bottom by PnL:")
+                for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (x[3], x[0]))[:top_n]:
+                    print(f"  {s}: pnl={pnl_sum:.4f} USDT | trades={t} | winrate={wr:.2f}%")
 
         # Best / Worst individual trades (from summary CSV)
         # We re-read the CSV to keep it simple and gather necessary fields
@@ -249,20 +283,36 @@ def main() -> None:
 
         if best_trade:
             pnl, bt = best_trade
-            print("Best trade:")
-            print(f"  {bt['symbol']} {bt['side']} pnl={pnl:.4f} USDT ({(bt['pnl_percent'] or 0.0):.2f}%) hold={fmt_dur(bt['hold_sec'] or 0)}")
-            print(f"  entry={bt['entry_price']} -> exit={bt['exit_price']}  sl={bt['sl_price']} tp={bt['tp_price']}")
-            print(f"  high={bt['high_watermark']} low={bt['low_watermark']} signal={bt['entry_signal']} score={bt['entry_signal_score']}")
-            if bt.get("entry_ts") and bt.get("exit_ts"):
-                print(f"  time: {bt['entry_ts']} -> {bt['exit_ts']}")
+            try:
+                from rich.panel import Panel
+                from rich.console import Console
+                console = Console()
+                console.print(Panel.fit(
+                    f"Best trade: {bt['symbol']} {bt['side']}\nPnL {pnl:.4f} USDT ({(bt['pnl_percent'] or 0.0):.2f}%)  Hold {fmt_dur(bt['hold_sec'] or 0)}\nEntry {bt['entry_price']} → Exit {bt['exit_price']}  SL {bt['sl_price']}  TP {bt['tp_price']}\nHigh {bt['high_watermark']}  Low {bt['low_watermark']}  Signal {bt['entry_signal']} (score {bt['entry_signal_score']})\nTime {bt.get('entry_ts')} → {bt.get('exit_ts')}",
+                    title="Best trade", style="bold green"))
+            except Exception:
+                print("Best trade:")
+                print(f"  {bt['symbol']} {bt['side']} pnl={pnl:.4f} USDT ({(bt['pnl_percent'] or 0.0):.2f}%) hold={fmt_dur(bt['hold_sec'] or 0)}")
+                print(f"  entry={bt['entry_price']} -> exit={bt['exit_price']}  sl={bt['sl_price']} tp={bt['tp_price']}")
+                print(f"  high={bt['high_watermark']} low={bt['low_watermark']} signal={bt['entry_signal']} score={bt['entry_signal_score']}")
+                if bt.get("entry_ts") and bt.get("exit_ts"):
+                    print(f"  time: {bt['entry_ts']} -> {bt['exit_ts']}")
         if worst_trade:
             pnl, wt = worst_trade
-            print("Worst trade:")
-            print(f"  {wt['symbol']} {wt['side']} pnl={pnl:.4f} USDT ({(wt['pnl_percent'] or 0.0):.2f}%) hold={fmt_dur(wt['hold_sec'] or 0)}")
-            print(f"  entry={wt['entry_price']} -> exit={wt['exit_price']}  sl={wt['sl_price']} tp={wt['tp_price']}")
-            print(f"  high={wt['high_watermark']} low={wt['low_watermark']} signal={wt['entry_signal']} score={wt['entry_signal_score']}")
-            if wt.get("entry_ts") and wt.get("exit_ts"):
-                print(f"  time: {wt['entry_ts']} -> {wt['exit_ts']}")
+            try:
+                from rich.panel import Panel
+                from rich.console import Console
+                console = Console()
+                console.print(Panel.fit(
+                    f"Worst trade: {wt['symbol']} {wt['side']}\nPnL {pnl:.4f} USDT ({(wt['pnl_percent'] or 0.0):.2f}%)  Hold {fmt_dur(wt['hold_sec'] or 0)}\nEntry {wt['entry_price']} → Exit {wt['exit_price']}  SL {wt['sl_price']}  TP {wt['tp_price']}\nHigh {wt['high_watermark']}  Low {wt['low_watermark']}  Signal {wt['entry_signal']} (score {wt['entry_signal_score']})\nTime {wt.get('entry_ts')} → {wt.get('exit_ts')}",
+                    title="Worst trade", style="bold red"))
+            except Exception:
+                print("Worst trade:")
+                print(f"  {wt['symbol']} {wt['side']} pnl={pnl:.4f} USDT ({(wt['pnl_percent'] or 0.0):.2f}%) hold={fmt_dur(wt['hold_sec'] or 0)}")
+                print(f"  entry={wt['entry_price']} -> exit={wt['exit_price']}  sl={wt['sl_price']} tp={wt['tp_price']}")
+                print(f"  high={wt['high_watermark']} low={wt['low_watermark']} signal={wt['entry_signal']} score={wt['entry_signal_score']}")
+                if wt.get("entry_ts") and wt.get("exit_ts"):
+                    print(f"  time: {wt['entry_ts']} -> {wt['exit_ts']}")
 
         # Last N trades with details
         if args.last and args.last > 0:
@@ -284,15 +334,50 @@ def main() -> None:
                 return dt or __import__("datetime").datetime.min
             rows.sort(key=_key)
             tail = rows[-int(args.last):]
-            for row in tail:
-                try:
-                    pnl = float(row.get("pnl_usdt") or 0.0)
-                except Exception:
-                    pnl = 0.0
-                pp = _try_float(row.get("pnl_percent")) or 0.0
-                print(f"  {row.get('exit_ts')} | {row.get('symbol')} {row.get('side')} pnl={pnl:.4f} USDT ({pp:.2f}%) hold={fmt_dur(_try_float(row.get('hold_sec')) or 0)}")
-                print(f"    entry={row.get('entry_price')} -> exit={row.get('exit_price')}  sl={row.get('sl_price')} tp={row.get('tp_price')}")
-                print(f"    high={row.get('high_watermark')} low={row.get('low_watermark')} signal={row.get('entry_signal')} score={row.get('entry_signal_score')}")
+            try:
+                from rich.table import Table
+                from rich.console import Console
+                console = Console()
+                tbl = Table(title=f"Last {len(tail)} trades", header_style="bold cyan")
+                tbl.add_column("Exit time")
+                tbl.add_column("Symbol")
+                tbl.add_column("Side")
+                tbl.add_column("PnL (USDT)", justify="right")
+                tbl.add_column("PnL %", justify="right")
+                tbl.add_column("Hold", justify="right")
+                tbl.add_column("Entry → Exit")
+                tbl.add_column("SL / TP")
+                tbl.add_column("High / Low")
+                tbl.add_column("Signal (score)")
+                for row in tail:
+                    try:
+                        pnl = float(row.get("pnl_usdt") or 0.0)
+                    except Exception:
+                        pnl = 0.0
+                    pp = _try_float(row.get("pnl_percent")) or 0.0
+                    tbl.add_row(
+                        str(row.get('exit_ts')),
+                        str(row.get('symbol')),
+                        str(row.get('side')),
+                        f"{pnl:.4f}",
+                        f"{pp:.2f}%",
+                        fmt_dur(_try_float(row.get('hold_sec')) or 0),
+                        f"{row.get('entry_price')} → {row.get('exit_price')}",
+                        f"{row.get('sl_price')} / {row.get('tp_price')}",
+                        f"{row.get('high_watermark')} / {row.get('low_watermark')}",
+                        f"{row.get('entry_signal')} ({row.get('entry_signal_score')})",
+                    )
+                console.print(tbl)
+            except Exception:
+                for row in tail:
+                    try:
+                        pnl = float(row.get("pnl_usdt") or 0.0)
+                    except Exception:
+                        pnl = 0.0
+                    pp = _try_float(row.get("pnl_percent")) or 0.0
+                    print(f"  {row.get('exit_ts')} | {row.get('symbol')} {row.get('side')} pnl={pnl:.4f} USDT ({pp:.2f}%) hold={fmt_dur(_try_float(row.get('hold_sec')) or 0)}")
+                    print(f"    entry={row.get('entry_price')} -> exit={row.get('exit_price')}  sl={row.get('sl_price')} tp={row.get('tp_price')}")
+                    print(f"    high={row.get('high_watermark')} low={row.get('low_watermark')} signal={row.get('entry_signal')} score={row.get('entry_signal_score')}")
     else:
         parser.print_help()
 

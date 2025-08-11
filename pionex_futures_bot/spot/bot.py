@@ -1243,7 +1243,26 @@ class SpotBot:
                     pass
 
             if exit_reason is not None:
-                self.log.info("%s EXIT trigger: reason=%s price=%.8f side=%s", symbol, exit_reason, price, state.side)
+                # Compute estimated PnL at trigger time for logging
+                try:
+                    if (state.side or "BUY") == "BUY":
+                        est_pnl = (price - (state.entry_price or price)) * (state.quantity or 0.0)
+                        est_pct = ((price - (state.entry_price or price)) / (state.entry_price or price) * 100.0) if (state.entry_price or 0.0) > 0 else 0.0
+                    else:
+                        est_pnl = ((state.entry_price or price) - price) * (state.quantity or 0.0)
+                        est_pct = (((state.entry_price or price) - price) / (state.entry_price or price) * 100.0) if (state.entry_price or 0.0) > 0 else 0.0
+                except Exception:
+                    est_pnl = 0.0
+                    est_pct = 0.0
+                self.log.info(
+                    "%s EXIT trigger: reason=%s price=%.8f side=%s est_pnl=%.6f (%.2f%%)",
+                    symbol,
+                    exit_reason,
+                    price,
+                    state.side,
+                    est_pnl,
+                    est_pct,
+                )
                 free_bal = self._get_free_base_balance(symbol)
                 step, min_dump, max_dump = self._parse_spot_rules(symbol)
                 sell_qty = self._normalize_spot_sell_quantity(symbol, state.quantity, free_balance=free_bal, force_min_if_possible=self.force_min_sell)
