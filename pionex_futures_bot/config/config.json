@@ -2,8 +2,8 @@
     "base_url": "https://api.pionex.com",
     "symbols": [
       "SOL_USDT",
-      "TON_USDT",
-      "POL_USDT",
+      "ETH_USDT",
+      "BTC_USDT",
       "NEAR_USDT",
       "SEI_USDT",
       "SUI_USDT",
