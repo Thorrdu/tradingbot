@@ -298,13 +298,8 @@ class SpotBot:
                 # Common alternates
                 alternates = [
                     Path("logs/runtime_state.json"),
-                    Path("logs/runtime_state_trending.json"),
                 ]
-                # Add derived alternate (swap between trending and default)
-                if "trending" in str(primary_state_path):
-                    alternates.insert(0, Path("logs/runtime_state.json"))
-                else:
-                    alternates.insert(0, Path("logs/runtime_state_trending.json"))
+                # No trending variant anymore
                 # Load distinct existing files except the primary one
                 seen = set([str(primary_state_path.resolve()) if primary_state_path.exists() else str(primary_state_path)])
                 for p in alternates:
@@ -593,7 +588,7 @@ class SpotBot:
             primary_state_path = Path(self.config.get("state_file", "logs/runtime_state.json"))
             from pionex_futures_bot.common.state_store import StateStore as _SS
             snapshots: list[dict] = []
-            for p in [primary_state_path, Path("logs/runtime_state.json"), Path("logs/runtime_state_trending.json")]:
+            for p in [primary_state_path, Path("logs/runtime_state.json")]:
                 try:
                     if p.exists():
                         data = _SS(p).load()

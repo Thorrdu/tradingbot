@@ -14,7 +14,7 @@
     "position_usdt": 25,
     "max_open_trades": 4,
     "max_open_trades_per_symbol": 1,
-    "breakout_change_percent": 0.30,
+    "breakout_change_percent": 0.35,
     "mode": "contrarian",
     "z_threshold": 2.4,
     "ewm_lambda": 0.94,
@@ -27,7 +27,7 @@
     "z_threshold_momentum": 2.1,
     "atr_window_sec": 480,
     "alpha_sl": 2.2,
-    "beta_tp": 3.2,
+    "beta_tp": 3.5,
     "breakout_lookback_sec": 60,
     "breakout_confirm_ticks": 2,
     "min_hold_sec": 25,
@@ -49,8 +49,8 @@
     "epsilon_pnl_usdt": 0.05,
     "epsilon_pnl_percent": 0.10,
     "dry_run": false,
-    "log_csv": "logs/trades_trending.csv",
-    "state_file": "logs/runtime_state_trending.json"
+  "log_csv": "logs/trades.csv",
+  "state_file": "logs/runtime_state.json"
   }
   
   

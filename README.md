@@ -159,7 +159,7 @@ python -m pionex_futures_bot spot --config ./pionex_futures_bot/config/config.js
 
 - Market regimes
   - Low volatility/flat: raise `breakout_change_percent`, lower `check_interval_sec` priority; consider fewer symbols.
-  - High volatility/trending: slightly reduce `breakout_change_percent` and/or increase `take_profit_percent`.
+  - Haute volatilité: réduire légèrement `breakout_change_percent` et/ou augmenter `take_profit_percent`.
 
 - Practical workflow
   1) Dry-run 1–3 days; inspect `logs/*bot.log` and `logs/*trades.csv`.
