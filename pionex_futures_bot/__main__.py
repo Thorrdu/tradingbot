@@ -21,16 +21,11 @@ def _run_spot(config_path: str) -> None:
     bot.run()
 
 
-def _run_perp(config_path: str) -> None:
-    from pionex_futures_bot.perp.bot import PerpBot
-
-    _chdir_to_project_root()
-    bot = PerpBot(config_path=config_path)
-    bot.run()
+# PERP bot removed
 
 
 def _print_config_example(kind: str) -> None:
-    example_path = Path(__file__).resolve().parent / ("config/perp_config.json" if kind == "perp" else "config/config.json")
+    example_path = Path(__file__).resolve().parent / ("config/config.json")
     try:
         print(example_path.read_text(encoding="utf-8"))
     except Exception:
@@ -55,17 +50,13 @@ def _print_config_example(kind: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="pionex_futures_bot",
-        description="CLI unifiée pour exécuter les bots Spot et PERP",
+        description="CLI pour exécuter le bot Spot",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_spot = sub.add_parser("spot", help="Démarrer le bot Spot")
     p_spot.add_argument("--config", default="config/config.json", help="Chemin du fichier de configuration Spot")
     p_spot.add_argument("--print-config", action="store_true", help="Affiche un exemple de configuration et sort")
-
-    p_perp = sub.add_parser("perp", help="Démarrer le bot PERP")
-    p_perp.add_argument("--config", default="config/perp_config.json", help="Chemin du fichier de configuration PERP")
-    p_perp.add_argument("--print-config", action="store_true", help="Affiche un exemple de configuration et sort")
 
     p_utils = sub.add_parser("symbols", help="Fetch and store market symbols (SPOT/PERP)")
     p_utils.add_argument("--type", choices=["SPOT", "PERP"], help="Market type to fetch")
@@ -75,6 +66,7 @@ def main() -> None:
     p_stats.add_argument("--file", default="logs/trades_summary.csv", help="Summary CSV file (default: logs/trades_summary.csv)")
     p_stats.add_argument("--symbol", default=None, help="Filter by symbol (e.g., BTC_USDT)")
     p_stats.add_argument("--since-hours", type=int, default=None, help="Only include trades with exit_ts within the last N hours")
+    p_stats.add_argument("--top", type=int, default=5, help="Show top N and bottom N pairs by PnL and winrate")
 
     args = parser.parse_args()
 
@@ -83,11 +75,6 @@ def main() -> None:
             _print_config_example("spot")
             return
         _run_spot(args.config)
-    elif args.cmd == "perp":
-        if args.print_config:
-            _print_config_example("perp")
-            return
-        _run_perp(args.config)
     elif args.cmd == "symbols":
         from pionex_futures_bot.clients import PionexClient
         _chdir_to_project_root()
@@ -133,6 +120,7 @@ def main() -> None:
         n_be = 0
         hold_sum = 0.0
         by_reason: dict[str, int] = {}
+        by_symbol: dict[str, dict[str, float]] = {}
         with csv_path.open("r", encoding="utf-8") as f:
             r = csv.DictReader(f)
             for row in r:
@@ -160,6 +148,12 @@ def main() -> None:
                     lost += abs(pnl)
                 else:
                     n_be += 1
+                # Per-symbol aggregates
+                s = by_symbol.setdefault(sym, {"trades": 0.0, "wins": 0.0, "pnl": 0.0})
+                s["trades"] += 1
+                s["pnl"] += pnl
+                if pnl > 0:
+                    s["wins"] += 1
         def fmt_dur(s: float) -> str:
             sec = int(round(max(0.0, s)))
             h, rem = divmod(sec, 3600)
@@ -184,6 +178,27 @@ def main() -> None:
             print("By reason:")
             for k, v in sorted(by_reason.items(), key=lambda kv: (-kv[1], kv[0])):
                 print(f"  {k}: {v}")
+        # Leaderboards by symbol
+        if by_symbol:
+            rows = []
+            for s, agg in by_symbol.items():
+                t = int(agg.get("trades", 0))
+                w = float(agg.get("wins", 0))
+                pnl_sum = float(agg.get("pnl", 0))
+                wr = (w / t * 100.0) if t else 0.0
+                rows.append((s, t, wr, pnl_sum))
+            # Sorts
+            top_n = max(1, int(args.top))
+            print("Top by PnL:")
+            for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (-x[3], x[0]))[:top_n]:
+                print(f"  {s}: pnl={pnl_sum:.4f} USDT | trades={t} | winrate={wr:.2f}%")
+            print("Bottom by PnL:")
+            for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (x[3], x[0]))[:top_n]:
+                print(f"  {s}: pnl={pnl_sum:.4f} USDT | trades={t} | winrate={wr:.2f}%")
+            print("Top by Winrate (min 3 trades):")
+            filt = [r for r in rows if r[1] >= 3]
+            for s, t, wr, pnl_sum in sorted(filt, key=lambda x: (-x[2], -x[3], x[0]))[:top_n]:
+                print(f"  {s}: winrate={wr:.2f}% | trades={t} | pnl={pnl_sum:.4f} USDT")
     else:
         parser.print_help()
 

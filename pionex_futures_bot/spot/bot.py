@@ -66,6 +66,11 @@ class SymbolState:
     last_signal_side: Optional[str] = None
     entry_time: float = 0.0
     max_price_since_entry: float = 0.0
+    min_price_since_entry: float = 0.0
+    entry_signal: Optional[str] = None
+    entry_signal_score: float = 0.0
+    entry_change_pct: float = 0.0
+    entry_z: float = 0.0
 
 
 class SpotBot:
@@ -1061,6 +1066,26 @@ class SpotBot:
                         state.order_id = (order.data or {}).get("orderId") if hasattr(order, "data") else None
                         state.entry_time = time.time()
                         state.max_price_since_entry = entry_price
+                        state.min_price_since_entry = entry_price
+                        # Record entry signal metadata
+                        try:
+                            state.entry_signal = (self._symbol_mode.get(symbol, self.signal_mode) if self.signal_mode == "auto" else self.signal_mode)
+                        except Exception:
+                            state.entry_signal = self.signal_mode
+                        try:
+                            state.entry_signal_score = float(sig.score or 0.0) if 'sig' in locals() else 0.0
+                        except Exception:
+                            state.entry_signal_score = 0.0
+                        try:
+                            state.entry_change_pct = float(change_pct)
+                        except Exception:
+                            state.entry_change_pct = 0.0
+                        try:
+                            # If z-based signal was used
+                            from pionex_futures_bot.common.strategy import VolatilityState as _VS
+                            state.entry_z = float(sig.score or 0.0) if isinstance(self._vol_state.get(symbol), _VS) else 0.0
+                        except Exception:
+                            state.entry_z = 0.0
                         state.confirm_streak = 0
                         state.last_signal_side = None
                         # Le slot global et le slot symbole sont déjà réservés, ne pas ré-incrémenter
@@ -1094,11 +1119,16 @@ class SpotBot:
                             symbol=symbol,
                             side=state.side,
                             quantity=state.quantity,
+                            entry_price=state.entry_price,
                             price=state.entry_price,
                             stop_loss=state.stop_loss,
                             take_profit=state.take_profit,
                             order_id=state.order_id,
                             reason="breakout",
+                            entry_signal=state.entry_signal,
+                            entry_signal_score=state.entry_signal_score,
+                            entry_change_pct=state.entry_change_pct,
+                            entry_z=state.entry_z,
                         )
                 state.last_price = price
                 time.sleep(self.check_interval_sec)
@@ -1140,10 +1170,13 @@ class SpotBot:
                     hit_sl_dbg,
                     hit_tp_dbg,
                 )
-                # Track max price since entry
+                # Track high/low since entry
                 try:
                     if price > 0:
                         state.max_price_since_entry = max(state.max_price_since_entry or state.entry_price, price)
+                        if not state.min_price_since_entry:
+                            state.min_price_since_entry = state.entry_price
+                        state.min_price_since_entry = min(state.min_price_since_entry, price)
                 except Exception:
                     pass
                 # Optional trailing/pullback logic
@@ -1256,20 +1289,24 @@ class SpotBot:
                     continue
                 else:
                     pnl = 0.0
+                    pnl_percent = 0.0
                     try:
                         if (state.side or "BUY") == "BUY":
                             pnl = (price - state.entry_price) * state.quantity
                         else:
                             pnl = (state.entry_price - price) * state.quantity
+                        pnl_percent = ((price - state.entry_price) / state.entry_price * 100.0) if (state.side == "BUY") else ((state.entry_price - price) / state.entry_price * 100.0)
                         # Apply epsilon threshold to ignore dust-level residuals
                         try:
-                            pnl_pct_abs = abs((price - state.entry_price) / state.entry_price * 100.0)
+                            pnl_pct_abs = abs(pnl_percent)
                             if abs(pnl) < self.epsilon_pnl_usdt and pnl_pct_abs < self.epsilon_pnl_percent:
                                 pnl = 0.0
+                                pnl_percent = 0.0
                         except Exception:
                             pass
                     except Exception:
                         pnl = 0.0
+                        pnl_percent = 0.0
 
                     self.logger.log(
                         event=f"EXIT_{exit_reason}",
@@ -1277,9 +1314,19 @@ class SpotBot:
                         side=state.side,
                         quantity=state.quantity,
                         price=price,
+                        entry_price=state.entry_price,
+                        exit_price=price,
                         order_id=(close_resp.data or {}).get("orderId") if hasattr(close_resp, "data") else None,
                         pnl=pnl,
+                        pnl_percent=pnl_percent,
                         reason=exit_reason,
+                        hold_sec=(time.time() - state.entry_time) if state.entry_time else None,
+                        high_watermark=state.max_price_since_entry,
+                        low_watermark=state.min_price_since_entry,
+                        entry_signal=state.entry_signal,
+                        entry_signal_score=state.entry_signal_score,
+                        entry_change_pct=state.entry_change_pct,
+                        entry_z=state.entry_z,
                     )
                     # Summarize trade for analysis
                     try:
@@ -1311,6 +1358,10 @@ class SpotBot:
                             exit_reason=exit_reason,
                             meta={
                                 "mode": self.signal_mode,
+                                "high_watermark": state.max_price_since_entry,
+                                "low_watermark": state.min_price_since_entry,
+                                "entry_signal": state.entry_signal,
+                                "entry_signal_score": state.entry_signal_score,
                                 "z_threshold": self.k_threshold,
                                 "alpha_sl": self.alpha_sl,
                                 "beta_tp": self.beta_tp,
@@ -1318,6 +1369,8 @@ class SpotBot:
                                 "breakout_change_percent": self.breakout_change_percent,
                                 "breakout_lookback_sec": self.breakout_lookback_sec,
                                 "breakout_confirm_ticks": self.breakout_confirm_ticks,
+                                "entry_change_pct": state.entry_change_pct,
+                                "entry_z": state.entry_z,
                             },
                         )
                     except Exception:

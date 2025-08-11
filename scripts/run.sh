@@ -5,8 +5,8 @@ MODE=${1:-}
 ACTION=${2:-start}
 CONFIG=${3:-}
 
-if [[ -z "$MODE" || ("$MODE" != "spot" && "$MODE" != "perp") ]]; then
-  echo "Usage: $0 {spot|perp} [start|stop|tail] [config_path]"
+if [[ -z "$MODE" || ("$MODE" != "spot") ]]; then
+  echo "Usage: $0 spot [start|stop|tail] [config_path]"
   exit 1
 fi
 
@@ -16,11 +16,7 @@ LOGS_DIR="$PROJECT_DIR/logs"
 mkdir -p "$LOGS_DIR"
 
 if [[ -z "$CONFIG" ]]; then
-  if [[ "$MODE" == "perp" ]]; then
-    CONFIG="$PROJECT_DIR/config/perp_config.json"
-  else
-    CONFIG="$PROJECT_DIR/config/config.json"
-  fi
+  CONFIG="$PROJECT_DIR/config/config.json"
 fi
 
 cd "$REPO_ROOT"
@@ -39,24 +35,18 @@ if [[ ! -f "$PROJECT_DIR/.env" && -f "$PROJECT_DIR/env.example" ]]; then
   cp "$PROJECT_DIR/env.example" "$PROJECT_DIR/.env"
 fi
 
-JOB_NAME="pionex_${MODE}"
-LOG_FILE="$LOGS_DIR/${MODE}_bot.log"
-[[ "$MODE" == "spot" ]] && LOG_FILE="$LOGS_DIR/bot_dryrun.log" || true
-[[ "$MODE" == "perp" ]] && LOG_FILE="$LOGS_DIR/perp_bot.log" || true
+JOB_NAME="pionex_spot"
+LOG_FILE="$LOGS_DIR/bot_dryrun.log"
 
 case "$ACTION" in
   start)
-    if [[ "$MODE" == "spot" ]]; then
-      nohup bash -lc "source '$PROJECT_DIR/.venv/bin/activate' && python -m pionex_futures_bot spot --config '$CONFIG'" >"$LOG_FILE" 2>&1 &
-    else
-      nohup bash -lc "source '$PROJECT_DIR/.venv/bin/activate' && python -m pionex_futures_bot perp --config '$CONFIG'" >"$LOG_FILE" 2>&1 &
-    fi
+    nohup bash -lc "source '$PROJECT_DIR/.venv/bin/activate' && python -m pionex_futures_bot spot --config '$CONFIG'" >"$LOG_FILE" 2>&1 &
     disown || true
     echo "Started $MODE. Logs: $LOG_FILE"
     ;;
   stop)
     # Best effort: find python -m pionex_futures_bot processes
-    pkill -f "pionex_futures_bot $MODE" || true
+    pkill -f "pionex_futures_bot spot" || true
     echo "Stopped $MODE (best-effort)"
     ;;
   tail)

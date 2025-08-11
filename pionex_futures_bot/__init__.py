@@ -1,6 +1,6 @@
-"""Pionex Futures Bot package.
+"""Pionex Spot Bot package.
 
-Contient les bots Spot et PERP et une CLI (voir `python -m pionex_futures_bot`).
+Contient le bot Spot et une CLI (voir `python -m pionex_futures_bot`).
 """
 
 __all__ = []

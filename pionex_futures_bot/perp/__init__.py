@@ -1,3 +1,0 @@
-"""PERP (Futures) bot package."""
-
-

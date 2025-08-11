@@ -19,9 +19,7 @@ The user cannot KYC on Binance, but **can KYC elsewhere**. Already has **USDT on
 - Conclusion: Grid bots are stable but slow for aggressive growth.
 
 ### Phase 2 — Futures Trading
-- Decided to move to **Perpetual Futures** for higher potential gains.
-- Pionex offers Futures bots and manual trading.
-- Default futures bots are too limited — opted for **custom API trading** for flexibility.
+- Une piste Futures avait été envisagée (Perpetuals) pour un gain potentiel plus élevé, mais cette branche est abandonnée dans cette version: seul le bot SPOT est conservé.
 
 ---
 
@@ -149,13 +147,8 @@ pionex_futures_bot/
     trade_logger.py
   spot/
     bot.py
-  perp/
-    bot.py
-    client.py
   pionex_client.py
-  perp_client.py
   config.json
-  perp_config.json
   env.example
   requirements.txt
 ```

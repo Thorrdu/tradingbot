@@ -1,5 +1,5 @@
 param(
-  [Parameter(Mandatory=$true)][ValidateSet('spot','perp')] [string]$Mode,
+  [Parameter(Mandatory=$true)][ValidateSet('spot')] [string]$Mode,
   [Parameter(Mandatory=$false)][ValidateSet('start','stop','tail')] [string]$Action = 'start',
   [Parameter(Mandatory=$false)] [string]$Config
 )
@@ -22,7 +22,7 @@ if (-not (Test-Path (Join-Path $project '.\.env')) -and (Test-Path (Join-Path $p
 }
 
 if (-not $Config) {
-  $Config = if ($Mode -eq 'perp') { (Join-Path $project 'config\perp_config.json') } else { (Join-Path $project 'config\config.json') }
+  $Config = (Join-Path $project 'config\config.json')
 } else {
   if (-not [System.IO.Path]::IsPathRooted($Config)) {
     try { $Config = (Resolve-Path $Config).Path } catch { $Config = (Join-Path $repoRoot $Config) }
@@ -32,8 +32,8 @@ if (-not $Config) {
 $logsDir = Join-Path $project 'logs'
 if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir | Out-Null }
 
-$jobName = if ($Mode -eq 'spot') { 'PionexSpot' } else { 'PionexPerp' }
-$logFile = if ($Mode -eq 'spot') { Join-Path $logsDir 'bot_dryrun.log' } else { Join-Path $logsDir 'perp_bot.log' }
+$jobName = 'PionexSpot'
+$logFile = Join-Path $logsDir 'bot_dryrun.log'
 
 if ($Action -eq 'start') {
   Write-Host "Launching $Mode with config: $Config"
@@ -41,11 +41,7 @@ if ($Action -eq 'start') {
     param($Repo, $Cfg, $ModeInner, $LogPath)
     Set-Location $Repo
     . .\pionex_futures_bot\.venv\Scripts\Activate.ps1
-    if ($ModeInner -eq 'spot') {
-      py -m pionex_futures_bot spot --config $Cfg *> $LogPath
-    } else {
-      py -m pionex_futures_bot perp --config $Cfg *> $LogPath
-    }
+    py -m pionex_futures_bot spot --config $Cfg *> $LogPath
   } -ArgumentList $repoRoot, $Config, $Mode, $logFile | Out-Null
   Write-Host "Started job '$jobName'. Logs: $logFile"
 } elseif ($Action -eq 'stop') {
