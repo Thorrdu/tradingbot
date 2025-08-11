@@ -133,6 +133,7 @@ def main() -> None:
         n_be = 0
         hold_sum = 0.0
         by_reason: dict[str, int] = {}
+        # Keep values as float for simplicity; cast to int when displaying
         by_symbol: dict[str, dict[str, float]] = {}
         def load_totals() -> None:
             nonlocal total, won, lost, n, n_win, n_loss, n_be, hold_sum, by_reason, by_symbol
@@ -167,11 +168,21 @@ def main() -> None:
                         lost += abs(pnl)
                     else:
                         n_be += 1
-                    s = by_symbol.setdefault(sym, {"trades": 0.0, "wins": 0.0, "pnl": 0.0})
+                    s = by_symbol.setdefault(
+                        sym,
+                        {"trades": 0.0, "wins": 0.0, "pnl": 0.0, "tp": 0.0, "sl": 0.0, "trail": 0.0},
+                    )
                     s["trades"] += 1
                     s["pnl"] += pnl
                     if pnl > 0:
                         s["wins"] += 1
+                    # Count exit reasons per symbol
+                    if reason == "TP":
+                        s["tp"] += 1
+                    elif reason == "SL":
+                        s["sl"] += 1
+                    elif reason in {"TRAIL", "MICRO_TRAIL", "GAIN_TRAIL"}:
+                        s["trail"] += 1
 
         load_totals()
         def fmt_dur(s: float) -> str:
@@ -230,24 +241,34 @@ def main() -> None:
                 w = float(agg.get("wins", 0))
                 pnl_sum = float(agg.get("pnl", 0))
                 wr = (w / t * 100.0) if t else 0.0
-                rows.append((s, t, wr, pnl_sum))
+                pnl_avg = (pnl_sum / t) if t else 0.0
+                tp_c = int(agg.get("tp", 0))
+                sl_c = int(agg.get("sl", 0))
+                trail_c = int(agg.get("trail", 0))
+                rows.append((s, t, wr, pnl_avg, pnl_sum, tp_c, sl_c, trail_c))
             # Single pairs recap table, sorted by PnL desc
             try:
                 from rich.table import Table
                 from rich.console import Console
                 console = Console()
-                tbl_pairs = Table(title="Pairs summary (sorted by PnL)", show_header=True, header_style="bold green")
+                tbl_pairs = Table(title="Pairs summary (sorted by total PnL)", show_header=True, header_style="bold green")
                 tbl_pairs.add_column("Symbol")
                 tbl_pairs.add_column("Trades", justify="right")
                 tbl_pairs.add_column("Winrate", justify="right")
-                tbl_pairs.add_column("PnL (USDT)", justify="right")
-                for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (-x[3], x[0])):
-                    tbl_pairs.add_row(s, str(t), f"{wr:.2f}%", f"{pnl_sum:.4f}")
+                tbl_pairs.add_column("PnL avg (USDT)", justify="right")
+                tbl_pairs.add_column("Total (USDT)", justify="right")
+                tbl_pairs.add_column("TP", justify="right")
+                tbl_pairs.add_column("SL", justify="right")
+                tbl_pairs.add_column("TRAIL", justify="right")
+                for s, t, wr, pnl_avg, pnl_sum, tp_c, sl_c, trail_c in sorted(rows, key=lambda x: (-x[4], x[0])):
+                    tbl_pairs.add_row(s, str(t), f"{wr:.2f}%", f"{pnl_avg:.4f}", f"{pnl_sum:.4f}", str(tp_c), str(sl_c), str(trail_c))
                 console.print(tbl_pairs)
             except Exception:
-                print("Pairs summary (sorted by PnL):")
-                for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (-x[3], x[0])):
-                    print(f"  {s}: pnl={pnl_sum:.4f} USDT | trades={t} | winrate={wr:.2f}%")
+                print("Pairs summary (sorted by total PnL):")
+                for s, t, wr, pnl_avg, pnl_sum, tp_c, sl_c, trail_c in sorted(rows, key=lambda x: (-x[4], x[0])):
+                    print(
+                        f"  {s}: avg={pnl_avg:.4f} USDT | total={pnl_sum:.4f} USDT | trades={t} | winrate={wr:.2f}% | TP={tp_c} SL={sl_c} TRAIL={trail_c}"
+                    )
 
         # Best / Worst individual trades (from summary CSV)
         # We re-read the CSV to keep it simple and gather necessary fields
