@@ -66,9 +66,9 @@ def main() -> None:
     p_stats.add_argument("--file", default="logs/trades_summary.csv", help="Summary CSV file (default: logs/trades_summary.csv)")
     p_stats.add_argument("--symbol", default=None, help="Filter by symbol (e.g., BTC_USDT)")
     p_stats.add_argument("--since-hours", type=int, default=None, help="Only include trades with exit_ts within the last N hours")
-    p_stats.add_argument("--top", type=int, default=5, help="Show top N and bottom N pairs by PnL and winrate")
+    p_stats.add_argument("--top", type=int, default=5, help="Deprecated: ignored (pairs table shows all)")
     p_stats.add_argument("--last", type=int, default=None, help="List the last N trades with details")
-    p_stats.add_argument("--top-trades", type=int, default=None, help="Show top N best and worst trades as tables")
+    p_stats.add_argument("--top-trades", type=int, default=None, help="Show top N best and worst trades as tables (default 5)")
 
     args = parser.parse_args()
 
@@ -220,34 +220,22 @@ def main() -> None:
                 pnl_sum = float(agg.get("pnl", 0))
                 wr = (w / t * 100.0) if t else 0.0
                 rows.append((s, t, wr, pnl_sum))
-            top_n = max(1, int(args.top))
+            # Single pairs recap table, sorted by PnL desc
             try:
                 from rich.table import Table
                 from rich.console import Console
                 console = Console()
-                tbl_top = Table(title=f"Top {top_n} by PnL", show_header=True, header_style="bold green")
-                tbl_top.add_column("Symbol")
-                tbl_top.add_column("Trades", justify="right")
-                tbl_top.add_column("Winrate", justify="right")
-                tbl_top.add_column("PnL (USDT)", justify="right")
-                for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (-x[3], x[0]))[:top_n]:
-                    tbl_top.add_row(s, str(t), f"{wr:.2f}%", f"{pnl_sum:.4f}")
-                console.print(tbl_top)
-
-                tbl_bot = Table(title=f"Bottom {top_n} by PnL", show_header=True, header_style="bold red")
-                tbl_bot.add_column("Symbol")
-                tbl_bot.add_column("Trades", justify="right")
-                tbl_bot.add_column("Winrate", justify="right")
-                tbl_bot.add_column("PnL (USDT)", justify="right")
-                for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (x[3], x[0]))[:top_n]:
-                    tbl_bot.add_row(s, str(t), f"{wr:.2f}%", f"{pnl_sum:.4f}")
-                console.print(tbl_bot)
+                tbl_pairs = Table(title="Pairs summary (sorted by PnL)", show_header=True, header_style="bold green")
+                tbl_pairs.add_column("Symbol")
+                tbl_pairs.add_column("Trades", justify="right")
+                tbl_pairs.add_column("Winrate", justify="right")
+                tbl_pairs.add_column("PnL (USDT)", justify="right")
+                for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (-x[3], x[0])):
+                    tbl_pairs.add_row(s, str(t), f"{wr:.2f}%", f"{pnl_sum:.4f}")
+                console.print(tbl_pairs)
             except Exception:
-                print("Top by PnL:")
-                for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (-x[3], x[0]))[:top_n]:
-                    print(f"  {s}: pnl={pnl_sum:.4f} USDT | trades={t} | winrate={wr:.2f}%")
-                print("Bottom by PnL:")
-                for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (x[3], x[0]))[:top_n]:
+                print("Pairs summary (sorted by PnL):")
+                for s, t, wr, pnl_sum in sorted(rows, key=lambda x: (-x[3], x[0])):
                     print(f"  {s}: pnl={pnl_sum:.4f} USDT | trades={t} | winrate={wr:.2f}%")
 
         # Best / Worst individual trades (from summary CSV)
@@ -293,42 +281,12 @@ def main() -> None:
                 payload_copy["pnl_usdt"] = pnl
                 all_trades.append(payload_copy)
 
-        if best_trade:
-            pnl, bt = best_trade
-            try:
-                from rich.panel import Panel
-                from rich.console import Console
-                console = Console()
-                console.print(Panel.fit(
-                    f"Best trade: {bt['symbol']} {bt['side']}\nPnL {pnl:.4f} USDT ({(bt['pnl_percent'] or 0.0):.2f}%)  Hold {fmt_dur(bt['hold_sec'] or 0)}\nEntry {bt['entry_price']} → Exit {bt['exit_price']}  SL {bt['sl_price']}  TP {bt['tp_price']}\nHigh {bt['high_watermark']}  Low {bt['low_watermark']}  Signal {bt['entry_signal']} (score {bt['entry_signal_score']})\nTime {bt.get('entry_ts')} → {bt.get('exit_ts')}",
-                    title="Best trade", style="bold green"))
-            except Exception:
-                print("Best trade:")
-                print(f"  {bt['symbol']} {bt['side']} pnl={pnl:.4f} USDT ({(bt['pnl_percent'] or 0.0):.2f}%) hold={fmt_dur(bt['hold_sec'] or 0)}")
-                print(f"  entry={bt['entry_price']} -> exit={bt['exit_price']}  sl={bt['sl_price']} tp={bt['tp_price']}")
-                print(f"  high={bt['high_watermark']} low={bt['low_watermark']} signal={bt['entry_signal']} score={bt['entry_signal_score']}")
-                if bt.get("entry_ts") and bt.get("exit_ts"):
-                    print(f"  time: {bt['entry_ts']} -> {bt['exit_ts']}")
-        if worst_trade:
-            pnl, wt = worst_trade
-            try:
-                from rich.panel import Panel
-                from rich.console import Console
-                console = Console()
-                console.print(Panel.fit(
-                    f"Worst trade: {wt['symbol']} {wt['side']}\nPnL {pnl:.4f} USDT ({(wt['pnl_percent'] or 0.0):.2f}%)  Hold {fmt_dur(wt['hold_sec'] or 0)}\nEntry {wt['entry_price']} → Exit {wt['exit_price']}  SL {wt['sl_price']}  TP {wt['tp_price']}\nHigh {wt['high_watermark']}  Low {wt['low_watermark']}  Signal {wt['entry_signal']} (score {wt['entry_signal_score']})\nTime {wt.get('entry_ts')} → {wt.get('exit_ts')}",
-                    title="Worst trade", style="bold red"))
-            except Exception:
-                print("Worst trade:")
-                print(f"  {wt['symbol']} {wt['side']} pnl={pnl:.4f} USDT ({(wt['pnl_percent'] or 0.0):.2f}%) hold={fmt_dur(wt['hold_sec'] or 0)}")
-                print(f"  entry={wt['entry_price']} -> exit={wt['exit_price']}  sl={wt['sl_price']} tp={wt['tp_price']}")
-                print(f"  high={wt['high_watermark']} low={wt['low_watermark']} signal={wt['entry_signal']} score={wt['entry_signal_score']}")
-                if wt.get("entry_ts") and wt.get("exit_ts"):
-                    print(f"  time: {wt['entry_ts']} -> {wt['exit_ts']}")
+        # Remove single best/worst panels in favor of tables below
+        pass
 
         # Top N best/worst trades as tables
-        if args.top_trades and args.top_trades > 0 and all_trades:
-            N = int(args.top_trades)
+        if all_trades:
+            N = int(args.top_trades) if (getattr(args, "top_trades", None) and args.top_trades > 0) else 5
             # Sort copies by pnl_usdt
             best_list = sorted(all_trades, key=lambda d: float(d.get("pnl_usdt") or 0.0), reverse=True)[:N]
             worst_list = sorted(all_trades, key=lambda d: float(d.get("pnl_usdt") or 0.0))[:N]
