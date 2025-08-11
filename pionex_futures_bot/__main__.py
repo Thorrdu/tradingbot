@@ -69,6 +69,10 @@ def main() -> None:
     p_stats.add_argument("--top", type=int, default=5, help="Deprecated: ignored (pairs table shows all)")
     p_stats.add_argument("--last", type=int, default=None, help="List the last N trades with details")
     p_stats.add_argument("--top-trades", type=int, default=None, help="Show top N best and worst trades as tables (default 5)")
+    p_stats.add_argument("--watch", action="store_true", help="Auto-refresh view with open positions and totals")
+    p_stats.add_argument("--state", default="logs/runtime_state.json", help="Path to runtime state JSON (default: logs/runtime_state.json)")
+    p_stats.add_argument("--interval", type=int, default=3, help="Refresh interval in seconds for --watch")
+    p_stats.add_argument("--base-url", default=os.getenv("PIONEX_BASE_URL", "https://api.pionex.com"), help="API base URL for price lookups")
 
     args = parser.parse_args()
 
@@ -130,39 +134,46 @@ def main() -> None:
         hold_sum = 0.0
         by_reason: dict[str, int] = {}
         by_symbol: dict[str, dict[str, float]] = {}
-        with csv_path.open("r", encoding="utf-8") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                sym = (row.get("symbol") or "").strip()
-                if args.symbol and sym != args.symbol:
-                    continue
-                exit_ts = parse_ts(row.get("exit_ts"))
-                if since_dt and (not exit_ts or exit_ts < since_dt):
-                    continue
-                try:
-                    pnl = float(row.get("pnl_usdt") or 0.0)
-                    hold = float(row.get("hold_sec") or 0.0)
-                except Exception:
-                    continue
-                n += 1
-                total += pnl
-                hold_sum += hold
-                reason = (row.get("exit_reason") or "").strip() or "UNKNOWN"
-                by_reason[reason] = by_reason.get(reason, 0) + 1
-                if pnl > 0:
-                    n_win += 1
-                    won += pnl
-                elif pnl < 0:
-                    n_loss += 1
-                    lost += abs(pnl)
-                else:
-                    n_be += 1
-                # Per-symbol aggregates
-                s = by_symbol.setdefault(sym, {"trades": 0.0, "wins": 0.0, "pnl": 0.0})
-                s["trades"] += 1
-                s["pnl"] += pnl
-                if pnl > 0:
-                    s["wins"] += 1
+        def load_totals() -> None:
+            nonlocal total, won, lost, n, n_win, n_loss, n_be, hold_sum, by_reason, by_symbol
+            total = won = lost = hold_sum = 0.0
+            n = n_win = n_loss = n_be = 0
+            by_reason = {}
+            by_symbol = {}
+            with csv_path.open("r", encoding="utf-8") as f:
+                r = csv.DictReader(f)
+                for row in r:
+                    sym = (row.get("symbol") or "").strip()
+                    if args.symbol and sym != args.symbol:
+                        continue
+                    exit_ts = parse_ts(row.get("exit_ts"))
+                    if since_dt and (not exit_ts or exit_ts < since_dt):
+                        continue
+                    try:
+                        pnl = float(row.get("pnl_usdt") or 0.0)
+                        hold = float(row.get("hold_sec") or 0.0)
+                    except Exception:
+                        continue
+                    n += 1
+                    total += pnl
+                    hold_sum += hold
+                    reason = (row.get("exit_reason") or "").strip() or "UNKNOWN"
+                    by_reason[reason] = by_reason.get(reason, 0) + 1
+                    if pnl > 0:
+                        n_win += 1
+                        won += pnl
+                    elif pnl < 0:
+                        n_loss += 1
+                        lost += abs(pnl)
+                    else:
+                        n_be += 1
+                    s = by_symbol.setdefault(sym, {"trades": 0.0, "wins": 0.0, "pnl": 0.0})
+                    s["trades"] += 1
+                    s["pnl"] += pnl
+                    if pnl > 0:
+                        s["wins"] += 1
+
+        load_totals()
         def fmt_dur(s: float) -> str:
             sec = int(round(max(0.0, s)))
             h, rem = divmod(sec, 3600)
@@ -335,6 +346,117 @@ def main() -> None:
                     pnl = float(row.get("pnl_usdt") or 0.0)
                     pp = float(row.get("pnl_percent") or 0.0)
                     print(f"  {row.get('exit_ts')} | {row.get('symbol')} {row.get('side')} pnl={pnl:.4f} USDT ({pp:.2f}%) hold={fmt_dur(float(row.get('hold_sec') or 0.0))}")
+
+        # Live watch mode (auto-refresh)
+        if args.watch:
+            try:
+                from rich.live import Live
+                from rich.layout import Layout
+                from rich.align import Align
+                from rich.text import Text
+            except Exception:
+                print("Install 'rich' to enable --watch UI: pip install rich")
+                return
+
+            # Lazy import to avoid heavy deps at top
+            from pionex_futures_bot.clients import PionexClient
+
+            state_path = Path(args.state)
+            client = PionexClient(api_key="", api_secret="", base_url=args.base_url, dry_run=True)
+
+            def render_once():
+                # Load totals fresh
+                load_totals()
+                win_rate = (n_win / n * 100.0) if n else 0.0
+                avg_hold = hold_sum / n if n else 0.0
+                # Load state
+                state = {}
+                try:
+                    import json as _J
+                    if state_path.exists():
+                        state = _J.loads(state_path.read_text(encoding="utf-8")) or {}
+                except Exception:
+                    state = {}
+                # Build open positions table
+                tbl_pos = Table(title="Open positions", header_style="bold yellow")
+                tbl_pos.add_column("Symbol")
+                tbl_pos.add_column("Side")
+                tbl_pos.add_column("Qty", justify="right")
+                tbl_pos.add_column("Entry", justify="right")
+                tbl_pos.add_column("Price", justify="right")
+                tbl_pos.add_column("SL", justify="right")
+                tbl_pos.add_column("TP", justify="right")
+                tbl_pos.add_column("PnL (USDT)", justify="right")
+                tbl_pos.add_column("PnL %", justify="right")
+                tbl_pos.add_column("Hold", justify="right")
+                open_count = 0
+                for sym, st in sorted(state.items()):
+                    try:
+                        if not isinstance(st, dict) or not st.get("in_position"):
+                            continue
+                        open_count += 1
+                        side = st.get("side") or ""
+                        qty = float(st.get("quantity") or 0.0)
+                        entry = float(st.get("entry_price") or 0.0)
+                        sl = float(st.get("stop_loss") or 0.0)
+                        tp = float(st.get("take_profit") or 0.0)
+                        et = float(st.get("entry_time") or 0.0)
+                        # Price
+                        pr = None
+                        r = client.get_price(sym)
+                        if r.ok and r.data and "price" in r.data:
+                            pr = float(r.data["price"])  # type: ignore[arg-type]
+                        pnl = 0.0
+                        pnlp = 0.0
+                        hold = "-"
+                        if pr and entry and qty:
+                            if (side or "BUY") == "BUY":
+                                pnl = (pr - entry) * qty
+                                pnlp = (pr - entry) / entry * 100.0
+                            else:
+                                pnl = (entry - pr) * qty
+                                pnlp = (entry - pr) / entry * 100.0
+                        if et:
+                            hold = fmt_dur(max(0.0, (datetime.utcnow() - datetime.utcfromtimestamp(et)).total_seconds()))
+                        tbl_pos.add_row(
+                            sym,
+                            str(side),
+                            f"{qty:.6f}",
+                            f"{entry:.6f}",
+                            f"{(pr if pr is not None else 0.0):.6f}",
+                            f"{sl:.6f}",
+                            f"{tp:.6f}",
+                            f"{pnl:.4f}",
+                            f"{pnlp:.2f}%",
+                            hold,
+                        )
+                    except Exception:
+                        continue
+                # Totals panel
+                try:
+                    from rich.panel import Panel
+                    totals = Panel.fit(
+                        f"Open: {open_count}\nTrades: {n}  Wins: {n_win}  Losses: {n_loss}  BE: {n_be}\nWin rate: {win_rate:.2f}%\nPnL: {total:.4f} USDT (Won {won:.4f} / Lost -{lost:.4f})\nAvg hold: {fmt_dur(avg_hold)}",
+                        title="Totals", style="bold cyan")
+                except Exception:
+                    totals = Text("Totals")
+                lay = Layout()
+                lay.split_column(
+                    Layout(totals, size=7),
+                    Layout(tbl_pos, ratio=1),
+                )
+                return lay
+
+            try:
+                from rich.console import Console
+                console = Console()
+                with Live(render_once(), console=console, refresh_per_second=max(1, int(1 / max(0.001, args.interval)) )) as live:
+                    import time as _t
+                    while True:
+                        _t.sleep(max(1, int(args.interval)))
+                        live.update(render_once())
+            except KeyboardInterrupt:
+                return
 
         # Last N trades with details
         if args.last and args.last > 0:
