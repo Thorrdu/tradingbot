@@ -60,6 +60,9 @@
     "cooloff_sec": 3600,
     "epsilon_pnl_usdt": 0.05,
     "epsilon_pnl_percent": 0.10,
+  "sl_rebound_guard_enabled": true,
+  "sl_rebound_guard_window_sec": 8,
+  "sl_rebound_guard_threshold_bps": 8,
     "dry_run": false,
   "log_csv": "logs/trades.csv",
   "state_file": "logs/runtime_state.json"

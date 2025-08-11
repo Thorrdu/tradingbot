@@ -71,6 +71,9 @@ class SymbolState:
     entry_signal_score: float = 0.0
     entry_change_pct: float = 0.0
     entry_z: float = 0.0
+    # SL rebound guard state
+    sl_guard_active: bool = False
+    sl_guard_started_at: float = 0.0
 
 
 class SpotBot:
@@ -192,6 +195,10 @@ class SpotBot:
         self._cooloff_reason: str = ""
         self.epsilon_pnl_usdt = float(self.config.get("epsilon_pnl_usdt", 0.05))
         self.epsilon_pnl_percent = float(self.config.get("epsilon_pnl_percent", 0.10))
+        # SL rebound guard (predict near-term rebound before SL exit)
+        self.sl_rebound_guard_enabled = bool(self.config.get("sl_rebound_guard_enabled", True))
+        self.sl_rebound_guard_window_sec = int(self.config.get("sl_rebound_guard_window_sec", 8))
+        self.sl_rebound_guard_threshold_bps = float(self.config.get("sl_rebound_guard_threshold_bps", 8.0))
 
         self.logger = TradeLogger(self.config.get("log_csv", "trades.csv"))
         self.summary_logger = TradeSummaryLogger(self.config.get("log_summary_csv", "logs/trades_summary.csv"))
@@ -1233,6 +1240,46 @@ class SpotBot:
                     if price <= stop_price_gain and exit_reason is None:
                         exit_reason = "GAIN_TRAIL"
                 if price <= sl_trigger:
+                    # SL rebound guard: if a small upward bounce is likely imminently, defer once
+                    if self.sl_rebound_guard_enabled and not state.sl_guard_active:
+                        # Lookback small window to estimate short-term momentum
+                        try:
+                            now_ts = now
+                            t0 = now_ts - max(2, self.sl_rebound_guard_window_sec)
+                            px0 = None
+                            for ts, px in reversed(list(self._price_history[symbol])):
+                                if ts <= t0:
+                                    px0 = px
+                                    break
+                            if px0:
+                                bps = (price - px0) / px0 * 10000.0
+                            else:
+                                bps = 0.0
+                        except Exception:
+                            bps = 0.0
+                        # If short-term slope is positive enough, arm a one-shot guard
+                        if bps >= self.sl_rebound_guard_threshold_bps:
+                            state.sl_guard_active = True
+                            state.sl_guard_started_at = now
+                            self.log.info("%s SL guard armed: slope=%.1f bps, defer exit for %ss", symbol, bps, self.sl_rebound_guard_window_sec)
+                            # Skip exit this tick
+                            state.last_price = price
+                            time.sleep(self.check_interval_sec)
+                            tick += 1
+                            continue
+                    # If already armed, allow one window to confirm rebound
+                    if self.sl_rebound_guard_enabled and state.sl_guard_active:
+                        if (now - state.sl_guard_started_at) <= max(2, self.sl_rebound_guard_window_sec):
+                            # Check bounce above hysteresis-adjusted threshold
+                            if price > sl_trigger * (1.0 + self.exit_hysteresis_percent / 100.0):
+                                self.log.info("%s SL guard bounce detected, cancel SL exit", symbol)
+                                state.sl_guard_active = False
+                                state.last_price = price
+                                time.sleep(self.check_interval_sec)
+                                tick += 1
+                                continue
+                        # Guard expired: proceed to SL
+                        state.sl_guard_active = False
                     exit_reason = "SL"
                 elif price >= tp_trigger:
                     if self.tp_pullback_confirm and (state.max_price_since_entry > 0):
