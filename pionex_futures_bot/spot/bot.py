@@ -171,6 +171,14 @@ class SpotBot:
         self.trailing_atr_mult = float(self.config.get("trailing_atr_mult", 1.0))
         self.tp_pullback_confirm = bool(self.config.get("tp_pullback_confirm", True))
         self.tp_pullback_retrace_percent = float(self.config.get("tp_pullback_retrace_percent", 0.15))
+        # Micro trailing: early profit protection before main trailing activation
+        self.micro_trailing_enabled = bool(self.config.get("micro_trailing_enabled", True))
+        self.micro_trailing_activation_gain_percent = float(self.config.get("micro_trailing_activation_gain_percent", 0.20))
+        self.micro_trailing_retrace_percent = float(self.config.get("micro_trailing_retrace_percent", 0.10))
+        # Gain-based trailing: lock profits by allowing a fixed giveback (absolute % of entry)
+        self.gain_trailing_enabled = bool(self.config.get("gain_trailing_enabled", True))
+        self.gain_trailing_activation_percent = float(self.config.get("gain_trailing_activation_percent", 0.20))
+        self.gain_trailing_giveback_percent = float(self.config.get("gain_trailing_giveback_percent", 0.10))
         # Buy alignment to step to reduce sell dust
         self.buy_align_step = bool(self.config.get("buy_align_step", True))
         self.buy_align_bias_bps = float(self.config.get("buy_align_bias_bps", 5.0))
@@ -1202,6 +1210,28 @@ class SpotBot:
                                 price,
                                 gain_pct_from_entry,
                             )
+                # Micro trailing: protect small profits even before main trailing activation or min_hold
+                try:
+                    gain_pct_from_entry = (state.max_price_since_entry - state.entry_price) / state.entry_price * 100.0
+                except Exception:
+                    gain_pct_from_entry = 0.0
+                if (
+                    self.micro_trailing_enabled
+                    and gain_pct_from_entry >= self.micro_trailing_activation_gain_percent
+                    and (state.max_price_since_entry > 0)
+                ):
+                    micro_stop = state.max_price_since_entry * (1.0 - self.micro_trailing_retrace_percent / 100.0)
+                    if price <= micro_stop and exit_reason is None:
+                        exit_reason = "MICRO_TRAIL"
+                # Gain-based trailing: lock absolute % of gain from entry (e.g., 0.6% peak, giveback 0.1% -> stop at +0.5%)
+                if (
+                    self.gain_trailing_enabled
+                    and gain_pct_from_entry >= self.gain_trailing_activation_percent
+                ):
+                    stop_gain_pct = max(0.0, gain_pct_from_entry - self.gain_trailing_giveback_percent)
+                    stop_price_gain = state.entry_price * (1.0 + stop_gain_pct / 100.0)
+                    if price <= stop_price_gain and exit_reason is None:
+                        exit_reason = "GAIN_TRAIL"
                 if price <= sl_trigger:
                     exit_reason = "SL"
                 elif price >= tp_trigger:
@@ -1215,10 +1245,39 @@ class SpotBot:
                     else:
                         exit_reason = "TP"
             elif state.side == "SELL":
+                # Track high/low for SELL as well
+                try:
+                    if price > 0:
+                        state.min_price_since_entry = min(state.min_price_since_entry or state.entry_price, price) if state.min_price_since_entry else price
+                        state.max_price_since_entry = max(state.max_price_since_entry or state.entry_price, price) if state.max_price_since_entry else price
+                except Exception:
+                    pass
                 if price >= state.stop_loss:
                     exit_reason = "SL"
                 elif price <= state.take_profit:
                     exit_reason = "TP"
+                # Micro trailing for SELL: protect small gains when price goes down from entry
+                try:
+                    gain_pct_from_entry_sell = (state.entry_price - state.min_price_since_entry) / state.entry_price * 100.0 if state.min_price_since_entry else 0.0
+                except Exception:
+                    gain_pct_from_entry_sell = 0.0
+                if (
+                    self.micro_trailing_enabled
+                    and gain_pct_from_entry_sell >= self.micro_trailing_activation_gain_percent
+                    and (state.min_price_since_entry > 0)
+                ):
+                    micro_stop_sell = state.min_price_since_entry * (1.0 + self.micro_trailing_retrace_percent / 100.0)
+                    if price >= micro_stop_sell and exit_reason is None:
+                        exit_reason = "MICRO_TRAIL"
+                # Gain-based trailing for SELL
+                if (
+                    self.gain_trailing_enabled
+                    and gain_pct_from_entry_sell >= self.gain_trailing_activation_percent
+                ):
+                    stop_gain_pct_sell = max(0.0, gain_pct_from_entry_sell - self.gain_trailing_giveback_percent)
+                    stop_price_gain_sell = state.entry_price * (1.0 - stop_gain_pct_sell / 100.0)
+                    if price >= stop_price_gain_sell and exit_reason is None:
+                        exit_reason = "GAIN_TRAIL"
 
             # Periodic debug while managing open position
             if tick % heartbeat_every == 0:
