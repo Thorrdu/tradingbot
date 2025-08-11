@@ -1357,6 +1357,8 @@ class SpotBot:
                                 "low_watermark": state.min_price_since_entry,
                                 "entry_signal": state.entry_signal,
                                 "entry_signal_score": state.entry_signal_score,
+                                "sl_price": state.stop_loss,
+                                "tp_price": state.take_profit,
                                 "z_threshold": self.k_threshold,
                                 "alpha_sl": self.alpha_sl,
                                 "beta_tp": self.beta_tp,

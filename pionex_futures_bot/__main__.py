@@ -67,6 +67,7 @@ def main() -> None:
     p_stats.add_argument("--symbol", default=None, help="Filter by symbol (e.g., BTC_USDT)")
     p_stats.add_argument("--since-hours", type=int, default=None, help="Only include trades with exit_ts within the last N hours")
     p_stats.add_argument("--top", type=int, default=5, help="Show top N and bottom N pairs by PnL and winrate")
+    p_stats.add_argument("--last", type=int, default=None, help="List the last N trades with details")
 
     args = parser.parse_args()
 
@@ -106,6 +107,13 @@ def main() -> None:
             try:
                 # Accept ...Z suffix
                 return datetime.fromisoformat(s.replace("Z", ""))
+            except Exception:
+                return None
+        def _try_float(v: object) -> float | None:
+            try:
+                if v is None:
+                    return None
+                return float(v)
             except Exception:
                 return None
         since_dt: datetime | None = None
@@ -199,6 +207,92 @@ def main() -> None:
             filt = [r for r in rows if r[1] >= 3]
             for s, t, wr, pnl_sum in sorted(filt, key=lambda x: (-x[2], -x[3], x[0]))[:top_n]:
                 print(f"  {s}: winrate={wr:.2f}% | trades={t} | pnl={pnl_sum:.4f} USDT")
+
+        # Best / Worst individual trades (from summary CSV)
+        # We re-read the CSV to keep it simple and gather necessary fields
+        best_trade = None
+        worst_trade = None
+        with csv_path.open("r", encoding="utf-8") as f:
+            r = __import__("csv").DictReader(f)
+            for row in r:
+                sym = (row.get("symbol") or "").strip()
+                if args.symbol and sym != args.symbol:
+                    continue
+                exit_ts = parse_ts(row.get("exit_ts"))
+                if since_dt and (not exit_ts or exit_ts < since_dt):
+                    continue
+                try:
+                    pnl = float(row.get("pnl_usdt") or 0.0)
+                except Exception:
+                    continue
+                payload = {
+                    "symbol": sym,
+                    "side": (row.get("side") or "").strip(),
+                    "entry_ts": (row.get("entry_ts") or "").strip(),
+                    "exit_ts": (row.get("exit_ts") or "").strip(),
+                    "entry_price": _try_float(row.get("entry_price")),
+                    "exit_price": _try_float(row.get("exit_price")),
+                    "pnl_usdt": pnl,
+                    "pnl_percent": _try_float(row.get("pnl_percent")),
+                    "hold_sec": _try_float(row.get("hold_sec")),
+                    "sl_price": _try_float(row.get("sl_price")),
+                    "tp_price": _try_float(row.get("tp_price")),
+                    "high_watermark": _try_float(row.get("high_watermark")),
+                    "low_watermark": _try_float(row.get("low_watermark")),
+                    "entry_signal": (row.get("entry_signal") or "").strip(),
+                    "entry_signal_score": _try_float(row.get("entry_signal_score")),
+                }
+                if best_trade is None or pnl > best_trade[0]:
+                    best_trade = (pnl, payload)
+                if worst_trade is None or pnl < worst_trade[0]:
+                    worst_trade = (pnl, payload)
+
+        if best_trade:
+            pnl, bt = best_trade
+            print("Best trade:")
+            print(f"  {bt['symbol']} {bt['side']} pnl={pnl:.4f} USDT ({(bt['pnl_percent'] or 0.0):.2f}%) hold={fmt_dur(bt['hold_sec'] or 0)}")
+            print(f"  entry={bt['entry_price']} -> exit={bt['exit_price']}  sl={bt['sl_price']} tp={bt['tp_price']}")
+            print(f"  high={bt['high_watermark']} low={bt['low_watermark']} signal={bt['entry_signal']} score={bt['entry_signal_score']}")
+            if bt.get("entry_ts") and bt.get("exit_ts"):
+                print(f"  time: {bt['entry_ts']} -> {bt['exit_ts']}")
+        if worst_trade:
+            pnl, wt = worst_trade
+            print("Worst trade:")
+            print(f"  {wt['symbol']} {wt['side']} pnl={pnl:.4f} USDT ({(wt['pnl_percent'] or 0.0):.2f}%) hold={fmt_dur(wt['hold_sec'] or 0)}")
+            print(f"  entry={wt['entry_price']} -> exit={wt['exit_price']}  sl={wt['sl_price']} tp={wt['tp_price']}")
+            print(f"  high={wt['high_watermark']} low={wt['low_watermark']} signal={wt['entry_signal']} score={wt['entry_signal_score']}")
+            if wt.get("entry_ts") and wt.get("exit_ts"):
+                print(f"  time: {wt['entry_ts']} -> {wt['exit_ts']}")
+
+        # Last N trades with details
+        if args.last and args.last > 0:
+            print(f"Last {args.last} trades:")
+            rows = []
+            with csv_path.open("r", encoding="utf-8") as f:
+                r = __import__("csv").DictReader(f)
+                for row in r:
+                    sym = (row.get("symbol") or "").strip()
+                    if args.symbol and sym != args.symbol:
+                        continue
+                    exit_ts = parse_ts(row.get("exit_ts"))
+                    if since_dt and (not exit_ts or exit_ts < since_dt):
+                        continue
+                    rows.append(row)
+            # Sort by exit time ascending then take last N
+            def _key(r):
+                dt = parse_ts(r.get("exit_ts"))
+                return dt or __import__("datetime").datetime.min
+            rows.sort(key=_key)
+            tail = rows[-int(args.last):]
+            for row in tail:
+                try:
+                    pnl = float(row.get("pnl_usdt") or 0.0)
+                except Exception:
+                    pnl = 0.0
+                pp = _try_float(row.get("pnl_percent")) or 0.0
+                print(f"  {row.get('exit_ts')} | {row.get('symbol')} {row.get('side')} pnl={pnl:.4f} USDT ({pp:.2f}%) hold={fmt_dur(_try_float(row.get('hold_sec')) or 0)}")
+                print(f"    entry={row.get('entry_price')} -> exit={row.get('exit_price')}  sl={row.get('sl_price')} tp={row.get('tp_price')}")
+                print(f"    high={row.get('high_watermark')} low={row.get('low_watermark')} signal={row.get('entry_signal')} score={row.get('entry_signal_score')}")
     else:
         parser.print_help()
 

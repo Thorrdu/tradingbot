@@ -139,6 +139,8 @@ class TradeSummaryLogger:
         "low_watermark",
         "entry_signal",
         "entry_signal_score",
+        "sl_price",
+        "tp_price",
     ]
 
     def __init__(self, csv_path: str = "trades_summary.csv") -> None:
@@ -209,6 +211,8 @@ class TradeSummaryLogger:
             "low_watermark": meta.get("low_watermark") if meta else None,
             "entry_signal": meta.get("entry_signal") if meta else None,
             "entry_signal_score": meta.get("entry_signal_score") if meta else None,
+            "sl_price": meta.get("sl_price") if meta else None,
+            "tp_price": meta.get("tp_price") if meta else None,
         }
         with self.csv_path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=self.fieldnames)
