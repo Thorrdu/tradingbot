@@ -57,18 +57,36 @@ class ExecutionLayer:
 
     def place_entry(self, *, symbol: str, price_hint: float, amount_usdt: float,
                     client_order_id: Optional[str]) -> Dict[str, Any]:
+        import logging
+        log = logging.getLogger("execution")
+        log.debug("entry: symbol=%s hint=%.8f amount=%.4f prefer_maker=%s", symbol, price_hint, amount_usdt, self.prefer_maker)
         if not self.prefer_maker:
             r = self.client.place_market_order(symbol=symbol, side="BUY", amount=amount_usdt, client_order_id=client_order_id)
+            log.debug("entry.market resp ok=%s data=%s err=%s", getattr(r, 'ok', None), getattr(r, 'data', None), getattr(r, 'error', None))
+            # Confirmation si possible
+            try:
+                oid = (getattr(r, 'data', {}) or {}).get('orderId')
+                if oid:
+                    confirm = getattr(self.client, 'get_order', None)
+                    if callable(confirm):
+                        cr = confirm(symbol=symbol, order_id=str(oid))
+                        log.debug("entry.market confirm ok=%s data=%s err=%s", getattr(cr, 'ok', None), getattr(cr, 'data', None), getattr(cr, 'error', None))
+            except Exception:
+                pass
             return {"ok": r.ok, "data": getattr(r, "data", None), "error": getattr(r, "error", None)}
 
         book = self.get_book_ticker(symbol)
         if not book:
+            log.debug("entry: no book, fallback to market")
             r = self.client.place_market_order(symbol=symbol, side="BUY", amount=amount_usdt, client_order_id=client_order_id)
+            log.debug("entry.market resp ok=%s data=%s err=%s", getattr(r, 'ok', None), getattr(r, 'data', None), getattr(r, 'error', None))
             return {"ok": r.ok, "data": getattr(r, "data", None), "error": getattr(r, "error", None)}
         bid = book.bid
         # maker price = bid - offset
         px = bid * (1.0 - max(0.0, self.maker_offset_bps) / 10000.0)
+        log.debug("entry: try maker LIMIT price=%.8f", px)
         lim = self._place_limit(symbol=symbol, side="BUY", price=px, size=0.0, client_order_id=client_order_id)
+        log.debug("entry.limit resp ok=%s data=%s err=%s", lim.get('ok'), lim.get('data'), lim.get('error'))
         if lim.get("ok"):
             # wait fill with timeout (poll using get_order when client supports it)
             t0 = time.time()
@@ -76,7 +94,9 @@ class ExecutionLayer:
                 time.sleep(0.2)
                 break
         # fallback
+        log.debug("entry: fallback MARKET")
         r = self.client.place_market_order(symbol=symbol, side="BUY", amount=amount_usdt, client_order_id=client_order_id)
+        log.debug("entry.market resp ok=%s data=%s err=%s", getattr(r, 'ok', None), getattr(r, 'data', None), getattr(r, 'error', None))
         return {"ok": r.ok, "data": getattr(r, "data", None), "error": getattr(r, "error", None)}
 
     def place_exit_market(self, *, symbol: str, side: str, quantity: float) -> Dict[str, Any]:
