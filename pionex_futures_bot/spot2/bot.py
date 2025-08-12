@@ -117,6 +117,9 @@ class SpotBotV2:
         self.dynamic_z_enabled = bool(self.config.get("dynamic_z_enabled", True))
         self.dynamic_z_percentile = float(self.config.get("dynamic_z_percentile", 0.7))
         self.verify_after_trade = bool(self.config.get("verify_after_trade", True))
+        # Throttling caps
+        self.max_open_trades = int(self.config.get("max_open_trades", 1))
+        self.max_open_trades_per_symbol = int(self.config.get("max_open_trades_per_symbol", 1))
 
         # State
         self._states: Dict[str, SymbolState] = {s: SymbolState() for s in self.symbols}
@@ -127,6 +130,28 @@ class SpotBotV2:
         self.state_store = StateStore(self.config.get("state_file", "spot2/logs/runtime_state.json"))
         self.logger = TradeLogger(self.config.get("log_csv", "spot2/logs/trades.csv"))
         self.summary_logger = TradeSummaryLogger(self.config.get("summary_csv", "spot2/logs/trades_summary.csv"))
+        # Concurrency guards and counters
+        self._open_trades_lock = threading.Lock()
+        self._open_trades_count = 0
+        self._symbol_open_count: Dict[str, int] = {s: 0 for s in self.symbols}
+        # Initialize counters from persisted state to enforce caps immediately
+        try:
+            persisted = self.state_store.load()
+            if isinstance(persisted, dict):
+                for sym, data in persisted.items():
+                    if sym in self._states and isinstance(data, dict) and data.get("in_position"):
+                        self._states[sym].in_position = True
+                        self._states[sym].side = data.get("side")
+                        try:
+                            self._states[sym].quantity = float(data.get("quantity", 0.0))
+                            self._states[sym].entry_price = float(data.get("entry_price", 0.0))
+                        except Exception:
+                            pass
+                        with self._open_trades_lock:
+                            self._open_trades_count += 1
+                            self._symbol_open_count[sym] = self._symbol_open_count.get(sym, 0) + 1
+        except Exception:
+            pass
 
     # --- Helpers ---
     def _base_asset(self, symbol: str) -> str:
@@ -188,11 +213,9 @@ class SpotBotV2:
         tick = 0
         while True:
             # Si trop de positions sont ouvertes globalement, geler les symboles sans position
-            try:
-                max_open = int(self.config.get("max_open_trades", 1))
-            except Exception:
-                max_open = 1
-            open_count = sum(1 for s in self._states.values() if s.in_position)
+            with self._open_trades_lock:
+                open_count = self._open_trades_count
+                max_open = self.max_open_trades
             if open_count >= max_open and not st.in_position:
                 # Backoff agressif pour réduire la charge: ne rafraîchit pas les prix
                 if (tick % max(1, int(60 / max(1, self.check_interval_sec)))) == 0:
@@ -241,13 +264,16 @@ class SpotBotV2:
                 else:
                     tick = 0
                 should_enter = sig.side == "BUY" and tick >= self.breakout_confirm_ticks
-                # Global guardrail: respect max_open_trades
-                try:
-                    max_open = int(self.config.get("max_open_trades", 1))
-                except Exception:
-                    max_open = 1
-                open_count = sum(1 for s in self._states.values() if s.in_position)
-                if should_enter and open_count < max_open:
+                # Global + per-symbol guardrail with atomic reservation
+                can_enter = False
+                if should_enter:
+                    with self._open_trades_lock:
+                        cur_sym = self._symbol_open_count.get(symbol, 0)
+                        if cur_sym < self.max_open_trades_per_symbol and self._open_trades_count < self.max_open_trades:
+                            self._symbol_open_count[symbol] = cur_sym + 1
+                            self._open_trades_count += 1
+                            can_enter = True
+                if can_enter:
                     # Place maker-preferred entry
                     amt = self.position_usdt
                     pre_free = self._get_free_base_balance(symbol)
@@ -299,6 +325,14 @@ class SpotBotV2:
                                 self.state_store.update_symbol(symbol, {"quantity": st.quantity})
                         except Exception:
                             pass
+                    else:
+                        # Release reservations on failure
+                        with self._open_trades_lock:
+                            if self._open_trades_count > 0:
+                                self._open_trades_count -= 1
+                            cur_sym = self._symbol_open_count.get(symbol, 0)
+                            if cur_sym > 0:
+                                self._symbol_open_count[symbol] = cur_sym - 1
             # Manage exits: SL / TP / trailing with maker-preferred for TP/trailing
             if st.in_position:
                 elapsed = now - (st.entry_time or now)
@@ -389,6 +423,13 @@ class SpotBotV2:
                     st.entry_time = 0.0
                     st.max_price_since_entry = 0.0
                     self.state_store.clear_symbol(symbol)
+                    # Release reservations after successful exit
+                    with self._open_trades_lock:
+                        if self._open_trades_count > 0:
+                            self._open_trades_count -= 1
+                        cur_sym = self._symbol_open_count.get(symbol, 0)
+                        if cur_sym > 0:
+                            self._symbol_open_count[symbol] = cur_sym - 1
             st.last_price = price
             time.sleep(self.check_interval_sec)
 
