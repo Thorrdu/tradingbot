@@ -134,17 +134,22 @@ class SpotBotV2:
         self._open_trades_lock = threading.Lock()
         self._open_trades_count = 0
         self._symbol_open_count: Dict[str, int] = {s: 0 for s in self.symbols}
-        # Initialize counters from persisted state to enforce caps immediately
+        # Initialize state and counters from persisted store to enforce caps immediately
         try:
             persisted = self.state_store.load()
             if isinstance(persisted, dict):
                 for sym, data in persisted.items():
                     if sym in self._states and isinstance(data, dict) and data.get("in_position"):
-                        self._states[sym].in_position = True
-                        self._states[sym].side = data.get("side")
+                        st = self._states[sym]
+                        st.in_position = True
+                        st.side = data.get("side")
                         try:
-                            self._states[sym].quantity = float(data.get("quantity", 0.0))
-                            self._states[sym].entry_price = float(data.get("entry_price", 0.0))
+                            st.quantity = float(data.get("quantity", 0.0))
+                            st.entry_price = float(data.get("entry_price", 0.0))
+                            st.stop_loss = float(data.get("stop_loss", 0.0)) if data.get("stop_loss") is not None else st.stop_loss
+                            st.take_profit = float(data.get("take_profit", 0.0)) if data.get("take_profit") is not None else st.take_profit
+                            st.entry_time = float(data.get("entry_time", 0.0))
+                            st.max_price_since_entry = float(data.get("max_price_since_entry", st.entry_price or 0.0))
                         except Exception:
                             pass
                         with self._open_trades_lock:
@@ -246,7 +251,17 @@ class SpotBotV2:
                 continue
             price = float(r.data["price"])  # type: ignore[arg-type]
             now = time.time()
+            # Append current tick to history and trim old samples beyond lookback window (to keep ref moving)
             price_hist.append((now, price))
+            cutoff_keep = now - max(self.breakout_lookback_sec * 2, self.breakout_lookback_sec + 10)
+            # Remove old samples from the front
+            if len(price_hist) > 1:
+                try:
+                    # fast trim when many stale samples accumulate
+                    while len(price_hist) > 0 and price_hist[0][0] < cutoff_keep:
+                        price_hist.pop(0)
+                except Exception:
+                    pass
             cutoff = now - self.breakout_lookback_sec
             ref = price
             for ts, px in reversed(price_hist):
@@ -255,8 +270,13 @@ class SpotBotV2:
                     break
             if not st.in_position:
                 change_pct = (price - ref) / ref * 100.0
-                # update vol and z history
-                ret_pct = (price - (st.last_price or price)) / (st.last_price or price) * 100.0
+                # update vol and z history (ret based on last observed tick)
+                ret_pct = 0.0
+                try:
+                    prev_px = st.last_price if (st.last_price and st.last_price > 0) else ref
+                    ret_pct = (price - prev_px) / prev_px * 100.0 if prev_px > 0 else 0.0
+                except Exception:
+                    ret_pct = 0.0
                 self._vol_state[symbol] = update_volatility_state(state=self._vol_state[symbol], ret=ret_pct, lambda_ewm=self.ewm_lambda)
                 sigma = (self._vol_state[symbol].ewm_var ** 0.5) if self._vol_state[symbol].ewm_var > 0 else 0.0
                 k_base = self.z_threshold_contrarian
