@@ -21,6 +21,7 @@ pionex_futures_bot/.env
 pionex_futures_bot/logs/*
 pionex_futures_bot/spot/logs/*
 pionex_futures_bot/spot2/logs/*
+pionex_futures_bot/spot2/logs/runtime_state.json
 
 # Data/outputs generated at runtime
 nohup.out
