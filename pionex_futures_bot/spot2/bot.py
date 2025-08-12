@@ -47,9 +47,34 @@ class SpotBotV2:
                             datefmt="%Y-%m-%d %H:%M:%S")
         self.log = logging.getLogger("spot2")
 
+        # Charger les variables d'environnement depuis .env (racine et dossier module)
+        try:
+            from dotenv import load_dotenv  # type: ignore
+        except Exception:
+            load_dotenv = None  # type: ignore
+        if load_dotenv:
+            try:
+                # .env dans la racine de projet (courant)
+                load_dotenv(override=False)
+                # .env spécifique au dossier spot2/pionex_futures_bot
+                from pathlib import Path
+                load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
+            except Exception:
+                pass
+
+        api_key = os.getenv("API_KEY", "")
+        api_secret = os.getenv("API_SECRET", "")
+        if not api_key or not api_secret:
+            self.log.warning("API keys not found in environment; requests to private endpoints will fail (APIKEY_LOST)")
+        else:
+            # masquage pour debug: 4 premières et 4 dernières
+            def _mask(val: str) -> str:
+                return f"{val[:4]}…{val[-4:]}" if len(val) > 8 else "***"
+            self.log.info("API creds loaded | key=%s secret=%s", _mask(api_key), _mask(api_secret))
+
         # Client API
-        self.client = PionexClient(api_key=os.getenv("API_KEY", ""),
-                                   api_secret=os.getenv("API_SECRET", ""),
+        self.client = PionexClient(api_key=api_key,
+                                   api_secret=api_secret,
                                    base_url=self.config.get("base_url", os.getenv("PIONEX_BASE_URL", "https://api.pionex.com")),
                                    dry_run=bool(self.config.get("dry_run", True)))
 
