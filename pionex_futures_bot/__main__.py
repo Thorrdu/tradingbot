@@ -526,17 +526,16 @@ def main() -> None:
                                 # Commandes: close:SYMBOL ou filter:SYMBOL
                                 if cmd_buffer.lower().startswith('close:'):
                                     sym = cmd_buffer.split(':',1)[1].strip().upper()
-                                    st = load_state().get(sym)
-                                    if isinstance(st, dict) and st.get('in_position'):
-                                        try:
-                                            from pionex_futures_bot.spot2.clients.pionex_client import PionexClient as _PC  # type: ignore
-                                        except Exception:
-                                            from pionex_futures_bot.spot.clients.pionex_client import PionexClient as _PC  # type: ignore
-                                        client = _PC(api_key=os.getenv('API_KEY',''), api_secret=os.getenv('API_SECRET',''), base_url=os.getenv('PIONEX_BASE_URL','https://api.pionex.com'), dry_run=True)
-                                        qty = float(st.get('quantity') or 0.0)
-                                        side = str(st.get('side') or 'BUY')
-                                        if qty>0:
-                                            client.close_position(symbol=sym, side=side, quantity=qty)
+                                    # Ecrire un drapeau force_close dans le fichier d'état pour que le bot clôture au prochain tick
+                                    try:
+                                        import json as _J
+                                        cur = load_state()
+                                        ent = cur.get(sym, {}) if isinstance(cur, dict) else {}
+                                        ent['force_close'] = True
+                                        cur[sym] = ent
+                                        state_path.write_text(_J.dumps(cur, separators=(',',':')), encoding='utf-8')
+                                    except Exception:
+                                        pass
                                     cmd_buffer = ""
                                 elif cmd_buffer.lower().startswith('filter:'):
                                     current_symbol = cmd_buffer.split(':',1)[1].strip().upper()

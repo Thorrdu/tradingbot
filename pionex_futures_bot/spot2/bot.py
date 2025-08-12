@@ -248,6 +248,20 @@ class SpotBotV2:
                 sl_trig = sl_px * (1.0 - hysteresis / 100.0) if elapsed >= min_hold else 0.0
                 tp_trig = tp_px * (1.0 + hysteresis / 100.0) if elapsed >= min_hold else float("inf")
                 exit_reason = None
+                # Force close signal from state store (set by monitor)
+                try:
+                    cur = self.state_store.load()
+                    ent = cur.get(symbol)
+                    if isinstance(ent, dict) and ent.get("force_close"):
+                        exit_reason = "FORCE"
+                        pre_free = self._get_free_base_balance(symbol)
+                        exit_resp = self.exec.place_exit_market(symbol=symbol, side="BUY", quantity=st.quantity)
+                        # clear flag immediately to avoid loops
+                        ent.pop("force_close", None)
+                        cur[symbol] = ent
+                        self.state_store.save(cur)
+                except Exception:
+                    pass
                 # Track peak since entry for trailing
                 try:
                     if st.max_price_since_entry <= 0.0:
