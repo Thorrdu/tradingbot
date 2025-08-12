@@ -338,6 +338,7 @@ class PionexClient:
             try:
                 self.log.debug("POST %s?timestamp=%s json=%s", url, timestamp_ms, payload)
                 r = self.session.post(url, params=query_params, data=body_str, headers=headers, timeout=self.timeout_sec)
+                self.log.debug("RESP %s %s", r.status_code, (r.text or '')[:500])
                 if r.status_code == 429:
                     # Backoff on rate limit
                     attempt += 1
@@ -357,6 +358,7 @@ class PionexClient:
                     code = data.get("code")
                     message = data.get("message")
                     err = f"{code or ''} {message or ''}".strip()
+                    self.log.error("order_rejected code=%s message=%s", code, message)
                     return ApiResponse(ok=False, data=data, error=err or "result_false")
                 # Extract the essential identifiers for callers
                 if isinstance(data, dict):
@@ -366,6 +368,8 @@ class PionexClient:
                             "orderId": inner.get("orderId"),
                             "clientOrderId": inner.get("clientOrderId"),
                         }
+                        if not slim.get("orderId"):
+                            self.log.warning("order_created_without_id payload=%s", inner)
                         return ApiResponse(ok=True, data=slim, error=None)
                 return ApiResponse(ok=True, data=data, error=None)
             except Exception as exc:  # noqa: BLE001
@@ -445,9 +449,15 @@ class PionexClient:
             signature = self._build_signature(method="GET", path="/api/v1/trade/order", query_params=params, body_str=None)
             headers = {self.api_key_header: self.api_key, "PIONEX-SIGNATURE": signature}
             r = self.session.get(url, params=params, headers=headers, timeout=self.timeout_sec)
+            self.log.debug("GET %s params=%s -> %s %s", url, params, r.status_code, (r.text or '')[:500])
             if r.status_code != 200:
                 return ApiResponse(ok=False, data=None, error=f"HTTP {r.status_code}: {r.text[:200]}")
             data = r.json()
+            if isinstance(data, dict) and data.get("result") is False:
+                code = data.get("code")
+                message = data.get("message")
+                err = f"{code or ''} {message or ''}".strip()
+                return ApiResponse(ok=False, data=data, error=err or "result_false")
             return ApiResponse(ok=True, data=data.get("data") if isinstance(data, dict) else data, error=None)
         except Exception as exc:  # noqa: BLE001
             return ApiResponse(ok=False, data=None, error=str(exc))

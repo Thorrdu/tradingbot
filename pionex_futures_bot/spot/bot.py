@@ -1010,10 +1010,35 @@ class SpotBot:
                         order = self.client.place_market_order(symbol=symbol, side=provisional_side, quantity=quantity, client_order_id=client_id)
                     if not order.ok:
                         self.log.error("%s ENTRY failed: %s", symbol, order.error)
+                        # Si la réponse possède un corps data avec code/message, on les inclut
+                        try:
+                            if hasattr(order, "data") and isinstance(order.data, dict):
+                                code = order.data.get("code")
+                                msg = order.data.get("message")
+                                if code or msg:
+                                    self.log.error("%s ENTRY rejected code=%s message=%s", symbol, code, msg)
+                        except Exception:
+                            pass
                         # Libère le slot réservé car l'ordre a échoué
                         self._on_close()
                         self._release_symbol_slot(symbol)
                     else:
+                        # Confirmer l'existence de l'ordre côté API si possible
+                        try:
+                            created_order_id = (order.data or {}).get("orderId") if hasattr(order, "data") else None
+                            if created_order_id:
+                                confirm = self.client.get_order(symbol=symbol, order_id=str(created_order_id))
+                                if not confirm.ok:
+                                    self.log.error("%s ENTRY confirm failed: %s", symbol, confirm.error)
+                                    # Libère le slot et abandonne l'entrée sans changer l'état
+                                    self._on_close()
+                                    self._release_symbol_slot(symbol)
+                                    state.last_price = price
+                                    time.sleep(self.check_interval_sec)
+                                    tick += 1
+                                    continue
+                        except Exception:
+                            pass
                         # Determine actual entry quantity and price using fills if possible
                         entry_price = price
                         entry_qty = quantity if provisional_side == "SELL" else self._round_quantity(self.position_usdt / price)
