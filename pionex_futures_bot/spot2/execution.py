@@ -134,6 +134,8 @@ class ExecutionLayer:
 
     def place_exit_market(self, *, symbol: str, side: str, quantity: float) -> Dict[str, Any]:
         # Clamp size by dump rules if available
+        import logging
+        log = logging.getLogger("execution")
         try:
             rules = self.symbol_rules.get(symbol.upper()) or self.symbol_rules.get(self.client._normalize_symbol(symbol)) or {}
             min_dump = float(rules.get("minTradeDumping")) if rules.get("minTradeDumping") is not None else None
@@ -144,15 +146,20 @@ class ExecutionLayer:
                 quantity = max_dump
         except Exception:
             pass
+        log.info("exit.market: symbol=%s side=%s qty=%.8f", symbol, side, quantity)
         r = self.client.close_position(symbol=symbol, side=side, quantity=quantity)
+        log.debug("exit.market resp ok=%s data=%s err=%s", getattr(r, 'ok', None), getattr(r, 'data', None), getattr(r, 'error', None))
         return {"ok": r.ok, "data": getattr(r, "data", None), "error": getattr(r, "error", None)}
 
     # --- Exit attempts with maker LIMIT and timeout fallback ---
     def _wait_filled(self, *, symbol: str, order_id: str, timeout_sec: int) -> bool:
+        import logging
+        log = logging.getLogger("execution")
         t0 = time.time()
         get_order = getattr(self.client, "get_order", None)
         if not callable(get_order):
             return False
+        last_log = 0.0
         while time.time() - t0 < max(1, timeout_sec):
             try:
                 resp = get_order(symbol=symbol, order_id=order_id)
@@ -161,7 +168,20 @@ class ExecutionLayer:
                     status = str(data.get("status", "")).upper()
                     filled_size = float(data.get("filledSize", 0.0) or 0.0)
                     size = float(data.get("size", filled_size) or 0.0)
+                    now = time.time()
+                    # Log au plus une fois par seconde pour suivi
+                    if now - last_log >= 1.0:
+                        last_log = now
+                        log.debug(
+                            "exit.limit poll: symbol=%s oid=%s status=%s filled=%.8f/%.8f",
+                            symbol,
+                            order_id,
+                            status,
+                            filled_size,
+                            size,
+                        )
                     if status == "CLOSED" or (size > 0 and filled_size >= size):
+                        log.info("exit.limit filled: symbol=%s oid=%s", symbol, order_id)
                         return True
             except Exception:
                 pass
@@ -169,12 +189,16 @@ class ExecutionLayer:
         return False
 
     def place_exit_limit_maker_sell(self, *, symbol: str, quantity: float, min_price: float) -> Dict[str, Any]:
+        import logging
+        log = logging.getLogger("execution")
         # Price at least best ask to be maker, and not below min_price target
         book = self.get_book_ticker(symbol)
         ask = None if not book else float(book.ask)
         px = max(min_price, (ask or min_price))
         # Place LIMIT SELL
+        log.info("exit.limit maker: symbol=%s qty=%.8f px=%.8f timeout=%ss", symbol, quantity, px, self.exit_limit_timeout_sec)
         res = self._place_limit(symbol=symbol, side="SELL", price=px, size=quantity, client_order_id=None)
+        log.debug("exit.limit resp ok=%s data=%s err=%s", res.get('ok'), res.get('data'), res.get('error'))
         if res.get("ok") and res.get("data"):
             order_id = None
             data = res.get("data")
@@ -188,10 +212,12 @@ class ExecutionLayer:
             try:
                 cancel = getattr(self.client, "cancel_order", None)
                 if callable(cancel) and order_id:
+                    log.info("exit.limit cancel: symbol=%s oid=%s (timeout)", symbol, order_id)
                     cancel(symbol=symbol, order_id=order_id)
             except Exception:
                 pass
         # Fallback MARKET close
+        log.info("exit.fallback: MARKET close symbol=%s qty=%.8f", symbol, quantity)
         return self.place_exit_market(symbol=symbol, side="BUY", quantity=quantity)
 
 
