@@ -88,13 +88,17 @@ class ExecutionLayer:
         px = bid * (1.0 - max(0.0, self.maker_offset_bps) / 10000.0)
         # compute size from amount (Pionex LIMIT requires size)
         size = max(0.0, amount_usdt / max(px, 1e-12))
-        # apply symbol constraints if available
+        # apply symbol constraints if available (precision, min/max)
         try:
             rules = self.symbol_rules.get(symbol.upper()) or self.symbol_rules.get(self.client._normalize_symbol(symbol)) or {}
             min_size = float(rules.get("minTradeSize")) if rules.get("minTradeSize") is not None else None
             max_size = float(rules.get("maxTradeSize")) if rules.get("maxTradeSize") is not None else None
             # amountPrecision is for MARKET amount; basePrecision is qty precision
             base_prec = int(rules.get("basePrecision", 6)) if rules.get("basePrecision") is not None else 6
+            quote_prec = int(rules.get("quotePrecision", 2)) if rules.get("quotePrecision") is not None else 2
+            # round price to quote precision (tick size)
+            if quote_prec >= 0:
+                px = float(f"{px:.{quote_prec}f}")
             # round down to base precision
             if base_prec >= 0:
                 factor = 10 ** base_prec
@@ -116,11 +120,30 @@ class ExecutionLayer:
                 break
         # fallback
         log.debug("entry: fallback MARKET")
+        # Ensure amount respects minAmount when available
+        try:
+            rules = self.symbol_rules.get(symbol.upper()) or self.symbol_rules.get(self.client._normalize_symbol(symbol)) or {}
+            min_amount = float(rules.get("minAmount")) if rules.get("minAmount") is not None else None
+            if min_amount is not None and amount_usdt < min_amount:
+                amount_usdt = min_amount
+        except Exception:
+            pass
         r = self.client.place_market_order(symbol=symbol, side="BUY", amount=amount_usdt, client_order_id=client_order_id)
         log.debug("entry.market resp ok=%s data=%s err=%s", getattr(r, 'ok', None), getattr(r, 'data', None), getattr(r, 'error', None))
         return {"ok": r.ok, "data": getattr(r, "data", None), "error": getattr(r, "error", None)}
 
     def place_exit_market(self, *, symbol: str, side: str, quantity: float) -> Dict[str, Any]:
+        # Clamp size by dump rules if available
+        try:
+            rules = self.symbol_rules.get(symbol.upper()) or self.symbol_rules.get(self.client._normalize_symbol(symbol)) or {}
+            min_dump = float(rules.get("minTradeDumping")) if rules.get("minTradeDumping") is not None else None
+            max_dump = float(rules.get("maxTradeDumping")) if rules.get("maxTradeDumping") is not None else None
+            if min_dump is not None and quantity < min_dump:
+                quantity = min_dump
+            if max_dump is not None and quantity > max_dump:
+                quantity = max_dump
+        except Exception:
+            pass
         r = self.client.close_position(symbol=symbol, side=side, quantity=quantity)
         return {"ok": r.ok, "data": getattr(r, "data", None), "error": getattr(r, "error", None)}
 

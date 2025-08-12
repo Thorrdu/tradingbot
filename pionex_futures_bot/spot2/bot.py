@@ -214,84 +214,91 @@ class SpotBotV2:
                 if ts <= cutoff:
                     ref = px
                     break
-            change_pct = (price - ref) / ref * 100.0
-            # update vol and z history
-            ret_pct = (price - (st.last_price or price)) / (st.last_price or price) * 100.0
-            self._vol_state[symbol] = update_volatility_state(state=self._vol_state[symbol], ret=ret_pct, lambda_ewm=self.ewm_lambda)
-            sigma = (self._vol_state[symbol].ewm_var ** 0.5) if self._vol_state[symbol].ewm_var > 0 else 0.0
-            k_base = self.z_threshold_contrarian
-            sig = compute_signal_z(change_pct, sigma, k_base, mode="contrarian")
-            self._z_hist[symbol].push(sig.score)
-            if self.dynamic_z_enabled:
-                dyn = self._z_hist[symbol].percentile(self.dynamic_z_percentile)
-                eff = max(k_base, dyn)
-                sig = compute_signal_z(change_pct, sigma, eff, mode="contrarian")
+            if not st.in_position:
+                change_pct = (price - ref) / ref * 100.0
+                # update vol and z history
+                ret_pct = (price - (st.last_price or price)) / (st.last_price or price) * 100.0
+                self._vol_state[symbol] = update_volatility_state(state=self._vol_state[symbol], ret=ret_pct, lambda_ewm=self.ewm_lambda)
+                sigma = (self._vol_state[symbol].ewm_var ** 0.5) if self._vol_state[symbol].ewm_var > 0 else 0.0
+                k_base = self.z_threshold_contrarian
+                sig = compute_signal_z(change_pct, sigma, k_base, mode="contrarian")
+                self._z_hist[symbol].push(sig.score)
+                if self.dynamic_z_enabled:
+                    dyn = self._z_hist[symbol].percentile(self.dynamic_z_percentile)
+                    eff = max(k_base, dyn)
+                    sig = compute_signal_z(change_pct, sigma, eff, mode="contrarian")
 
-            # Simple spread filter using synthetic book
-            book = self.exec.get_book_ticker(symbol)
-            if book and sig.side == "BUY":
-                spread_bps = (book.ask - book.bid) / ((book.ask + book.bid) / 2.0) * 10000.0
-                if not should_enter_by_spread(spread_bps, self.entry_max_spread_bps):
-                    sig = type(sig)(side=None, score=sig.score)
+                # Simple spread filter using synthetic book
+                book = self.exec.get_book_ticker(symbol)
+                if book and sig.side == "BUY":
+                    spread_bps = (book.ask - book.bid) / ((book.ask + book.bid) / 2.0) * 10000.0
+                    if not should_enter_by_spread(spread_bps, self.entry_max_spread_bps):
+                        sig = type(sig)(side=None, score=sig.score)
 
-            # confirmation
-            if sig.side == "BUY":
-                tick += 1
-            else:
-                tick = 0
-            should_enter = sig.side == "BUY" and tick >= self.breakout_confirm_ticks
-            if should_enter and not st.in_position:
-                # Place maker-preferred entry
-                amt = self.position_usdt
-                pre_free = self._get_free_base_balance(symbol)
-                resp = self.exec.place_entry(symbol=symbol, price_hint=price, amount_usdt=amt, client_order_id=None)
-                if resp.get("ok"):
-                    st.in_position = True
-                    st.side = "BUY"
-                    st.entry_price = price
-                    st.quantity = max(0.0, amt / price)
-                    st.entry_time = now
-                    # Compute baseline SL/TP for display/control
-                    stop_loss_percent = float(self.config.get("stop_loss_percent", 2.0))
-                    take_profit_percent = float(self.config.get("take_profit_percent", 3.0))
-                    st.stop_loss = st.entry_price * (1.0 - stop_loss_percent / 100.0)
-                    st.take_profit = st.entry_price * (1.0 + take_profit_percent / 100.0)
-                    st.max_price_since_entry = st.entry_price
-                    self.state_store.update_symbol(symbol, {"in_position": True, "side": st.side, "quantity": st.quantity, "entry_price": st.entry_price, "entry_time": st.entry_time})
-                    # Persist additional fields
-                    self.state_store.update_symbol(symbol, {"stop_loss": st.stop_loss, "take_profit": st.take_profit, "max_price_since_entry": st.max_price_since_entry})
-                    self.logger.log(event="ENTRY", symbol=symbol, side=st.side, quantity=st.quantity, entry_price=st.entry_price, price=st.entry_price, stop_loss=st.stop_loss, take_profit=st.take_profit)
-                    self.log.info("%s ENTRY ok qty=%.6f entry=%.6f sl=%.6f tp=%.6f", symbol, st.quantity, st.entry_price, st.stop_loss, st.take_profit)
-                    # Vérification post-trade (ajustement quantité selon fills/balances)
-                    try:
-                        if self.verify_after_trade and not getattr(self.client, "dry_run", True):
-                            data = resp.get("data") or {}
-                            order_id = data.get("orderId") if isinstance(data, dict) else None
-                            if order_id:
-                                fills = self.client.get_fills_by_order_id(symbol, str(order_id))
-                                if fills.ok and fills.data:
-                                    arr = (fills.data.get("data") or {}).get("fills") if isinstance(fills.data, dict) else None
-                                    if isinstance(arr, list) and arr:
-                                        qsum = 0.0; notional = 0.0
-                                        for f in arr:
-                                            try:
-                                                qf = float(f.get("size", 0.0)); pf = float(f.get("price", 0.0))
-                                            except Exception:
-                                                qf = 0.0; pf = 0.0
-                                            qsum += qf; notional += qf * pf
-                                        if qsum > 0:
-                                            st.quantity = qsum
-                                            st.entry_price = (notional / qsum) if notional > 0 else st.entry_price
-                                            self.state_store.update_symbol(symbol, {"quantity": st.quantity, "entry_price": st.entry_price})
-                        # Ajustement via delta de balance (couvre résidus/fees)
-                        post_free = self._get_free_base_balance(symbol)
-                        delta_q = max(0.0, post_free - pre_free)
-                        if delta_q > 0 and abs(delta_q - st.quantity) > 1e-12:
-                            self.log.info("%s ENTRY balance adjust: qty %.6f -> %.6f (delta=%+.6f)", symbol, st.quantity, delta_q, delta_q - st.quantity)
-                            st.quantity = delta_q
-                            self.state_store.update_symbol(symbol, {"quantity": st.quantity})
-                    except Exception:
-                        pass
+                # confirmation
+                if sig.side == "BUY":
+                    tick += 1
+                else:
+                    tick = 0
+                should_enter = sig.side == "BUY" and tick >= self.breakout_confirm_ticks
+                # Global guardrail: respect max_open_trades
+                try:
+                    max_open = int(self.config.get("max_open_trades", 1))
+                except Exception:
+                    max_open = 1
+                open_count = sum(1 for s in self._states.values() if s.in_position)
+                if should_enter and open_count < max_open:
+                    # Place maker-preferred entry
+                    amt = self.position_usdt
+                    pre_free = self._get_free_base_balance(symbol)
+                    resp = self.exec.place_entry(symbol=symbol, price_hint=price, amount_usdt=amt, client_order_id=None)
+                    if resp.get("ok"):
+                        st.in_position = True
+                        st.side = "BUY"
+                        st.entry_price = price
+                        st.quantity = max(0.0, amt / price)
+                        st.entry_time = now
+                        # Compute baseline SL/TP for display/control
+                        stop_loss_percent = float(self.config.get("stop_loss_percent", 2.0))
+                        take_profit_percent = float(self.config.get("take_profit_percent", 3.0))
+                        st.stop_loss = st.entry_price * (1.0 - stop_loss_percent / 100.0)
+                        st.take_profit = st.entry_price * (1.0 + take_profit_percent / 100.0)
+                        st.max_price_since_entry = st.entry_price
+                        self.state_store.update_symbol(symbol, {"in_position": True, "side": st.side, "quantity": st.quantity, "entry_price": st.entry_price, "entry_time": st.entry_time})
+                        # Persist additional fields
+                        self.state_store.update_symbol(symbol, {"stop_loss": st.stop_loss, "take_profit": st.take_profit, "max_price_since_entry": st.max_price_since_entry})
+                        self.logger.log(event="ENTRY", symbol=symbol, side=st.side, quantity=st.quantity, entry_price=st.entry_price, price=st.entry_price, stop_loss=st.stop_loss, take_profit=st.take_profit)
+                        self.log.info("%s ENTRY ok qty=%.6f entry=%.6f sl=%.6f tp=%.6f", symbol, st.quantity, st.entry_price, st.stop_loss, st.take_profit)
+                        # Vérification post-trade (ajustement quantité selon fills/balances)
+                        try:
+                            if self.verify_after_trade and not getattr(self.client, "dry_run", True):
+                                data = resp.get("data") or {}
+                                order_id = data.get("orderId") if isinstance(data, dict) else None
+                                if order_id:
+                                    fills = self.client.get_fills_by_order_id(symbol, str(order_id))
+                                    if fills.ok and fills.data:
+                                        arr = (fills.data.get("data") or {}).get("fills") if isinstance(fills.data, dict) else None
+                                        if isinstance(arr, list) and arr:
+                                            qsum = 0.0; notional = 0.0
+                                            for f in arr:
+                                                try:
+                                                    qf = float(f.get("size", 0.0)); pf = float(f.get("price", 0.0))
+                                                except Exception:
+                                                    qf = 0.0; pf = 0.0
+                                                qsum += qf; notional += qf * pf
+                                            if qsum > 0:
+                                                st.quantity = qsum
+                                                st.entry_price = (notional / qsum) if notional > 0 else st.entry_price
+                                                self.state_store.update_symbol(symbol, {"quantity": st.quantity, "entry_price": st.entry_price})
+                            # Ajustement via delta de balance (couvre résidus/fees)
+                            post_free = self._get_free_base_balance(symbol)
+                            delta_q = max(0.0, post_free - pre_free)
+                            if delta_q > 0 and abs(delta_q - st.quantity) > 1e-12:
+                                self.log.info("%s ENTRY balance adjust: qty %.6f -> %.6f (delta=%+.6f)", symbol, st.quantity, delta_q, delta_q - st.quantity)
+                                st.quantity = delta_q
+                                self.state_store.update_symbol(symbol, {"quantity": st.quantity})
+                        except Exception:
+                            pass
             # Manage exits: SL / TP / trailing with maker-preferred for TP/trailing
             if st.in_position:
                 elapsed = now - (st.entry_time or now)
