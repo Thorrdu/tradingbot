@@ -346,6 +346,21 @@ class SpotBotV2:
                 sl_trig = sl_px * (1.0 - hysteresis / 100.0) if elapsed >= min_hold else 0.0
                 tp_trig = tp_px * (1.0 + hysteresis / 100.0) if elapsed >= min_hold else float("inf")
                 exit_reason = None
+                # Heartbeat/debug for position evaluation
+                try:
+                    self.log.debug(
+                        "%s eval: price=%.6f entry=%.6f sl_px=%.6f tp_px=%.6f sl_trig=%.6f tp_trig=%.6f hold=%ds",
+                        symbol,
+                        price,
+                        st.entry_price,
+                        sl_px,
+                        tp_px,
+                        sl_trig,
+                        tp_trig,
+                        int(elapsed),
+                    )
+                except Exception:
+                    pass
                 # Force close signal from state store (set by monitor)
                 try:
                     cur = self.state_store.load()
@@ -371,12 +386,22 @@ class SpotBotV2:
                 except Exception:
                     pass
                 if price <= sl_trig:
+                    self.log.info("%s SL trigger: price=%.6f <= sl_trig=%.6f (sl_px=%.6f, hold=%ds)", symbol, price, sl_trig, sl_px, int(elapsed))
                     exit_reason = "SL"
                     pre_free = self._get_free_base_balance(symbol)
                     exit_resp = self.exec.place_exit_market(symbol=symbol, side="BUY", quantity=st.quantity)
                 elif price >= tp_trig:
                     # TP: maker LIMIT si activé, sinon MARKET
                     exit_reason = "TP"
+                    self.log.info(
+                        "%s TP trigger: price=%.6f >= tp_trig=%.6f (tp_px=%.6f, hold=%ds) maker_for_tp=%s",
+                        symbol,
+                        price,
+                        tp_trig,
+                        tp_px,
+                        int(elapsed),
+                        bool(self.config.get("exit_maker_for_tp", True)),
+                    )
                     if bool(self.config.get("exit_maker_for_tp", True)):
                         pre_free = self._get_free_base_balance(symbol)
                         exit_resp = self.exec.place_exit_limit_maker_sell(symbol=symbol, quantity=st.quantity, min_price=tp_px)
@@ -391,8 +416,31 @@ class SpotBotV2:
                         retrace = float(self.config.get("trailing_retrace_percent", 0.25))
                         if gain_from_entry_pct >= act_gain:
                             trailing_stop = st.max_price_since_entry * (1.0 - retrace / 100.0)
+                            # Log evaluation of trailing window
+                            try:
+                                self.log.debug(
+                                    "%s TRAIL eval: peak=%.6f stop=%.6f price=%.6f gain%%=%.2f act%%=%.2f retrace%%=%.2f",
+                                    symbol,
+                                    st.max_price_since_entry,
+                                    trailing_stop,
+                                    price,
+                                    gain_from_entry_pct,
+                                    act_gain,
+                                    retrace,
+                                )
+                            except Exception:
+                                pass
                             if price <= trailing_stop:
                                 exit_reason = "TRAIL"
+                                self.log.info(
+                                    "%s TRAIL trigger: price=%.6f <= stop=%.6f (peak=%.6f, hold=%ds, maker_for_trail=%s)",
+                                    symbol,
+                                    price,
+                                    trailing_stop,
+                                    st.max_price_since_entry,
+                                    int(elapsed),
+                                    bool(self.config.get("exit_maker_for_trailing", True)),
+                                )
                                 if bool(self.config.get("exit_maker_for_trailing", True)):
                                     pre_free = self._get_free_base_balance(symbol)
                                     exit_resp = self.exec.place_exit_limit_maker_sell(symbol=symbol, quantity=st.quantity, min_price=trailing_stop)
