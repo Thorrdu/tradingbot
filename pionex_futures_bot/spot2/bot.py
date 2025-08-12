@@ -78,6 +78,23 @@ class SpotBotV2:
                                    base_url=self.config.get("base_url", os.getenv("PIONEX_BASE_URL", "https://api.pionex.com")),
                                    dry_run=bool(self.config.get("dry_run", True)))
 
+        # Load symbols trading rules (min/max, precisions)
+        import json as _J
+        from pathlib import Path as _P
+        rules_path = _P(self.config.get("symbols_rules_path", "spot2/config/symbols.json"))
+        self._symbol_rules: Dict[str, dict] = {}
+        try:
+            if rules_path.exists():
+                data = _J.loads(rules_path.read_text(encoding="utf-8"))
+                arr = data.get("symbols") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                for it in arr:
+                    if isinstance(it, dict) and it.get("symbol"):
+                        self._symbol_rules[str(it["symbol"]).upper()] = it
+            else:
+                self.log.warning("symbols rules file not found: %s", str(rules_path))
+        except Exception:
+            self.log.warning("failed to load symbols rules from %s", str(rules_path))
+
         # Execution layer
         self.exec = ExecutionLayer(
             self.client,
@@ -85,6 +102,7 @@ class SpotBotV2:
             maker_offset_bps=float(self.config.get("maker_offset_bps", 2.0)),
             entry_limit_timeout_sec=int(self.config.get("entry_limit_timeout_sec", 3)),
             exit_limit_timeout_sec=int(self.config.get("exit_limit_timeout_sec", 2)),
+            symbol_rules=self._symbol_rules,
         )
 
         # Params
@@ -169,6 +187,20 @@ class SpotBotV2:
         price_hist: list[tuple[float, float]] = []
         tick = 0
         while True:
+            # Si trop de positions sont ouvertes globalement, geler les symboles sans position
+            try:
+                max_open = int(self.config.get("max_open_trades", 1))
+            except Exception:
+                max_open = 1
+            open_count = sum(1 for s in self._states.values() if s.in_position)
+            if open_count >= max_open and not st.in_position:
+                # Backoff agressif pour réduire la charge: ne rafraîchit pas les prix
+                if (tick % max(1, int(60 / max(1, self.check_interval_sec)))) == 0:
+                    self.log.info("%s idle: max_open_trades reached (%d/%d)", symbol, open_count, max_open)
+                time.sleep(max(self.check_interval_sec, int(self.config.get("idle_backoff_sec", 24))))
+                tick += 1
+                continue
+
             r = self.client.get_price(symbol)
             if not r.ok or not r.data or "price" not in r.data:
                 time.sleep(self.check_interval_sec)

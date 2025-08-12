@@ -13,12 +13,14 @@ class BookTicker:
 
 class ExecutionLayer:
     def __init__(self, client, *, prefer_maker: bool, maker_offset_bps: float,
-                 entry_limit_timeout_sec: int, exit_limit_timeout_sec: int) -> None:
+                 entry_limit_timeout_sec: int, exit_limit_timeout_sec: int,
+                 symbol_rules: Optional[Dict[str, dict]] = None) -> None:
         self.client = client
         self.prefer_maker = bool(prefer_maker)
         self.maker_offset_bps = float(maker_offset_bps)
         self.entry_limit_timeout_sec = int(entry_limit_timeout_sec)
         self.exit_limit_timeout_sec = int(exit_limit_timeout_sec)
+        self.symbol_rules = symbol_rules or {}
 
     # --- Market data helpers ---
     def get_book_ticker(self, symbol: str) -> Optional[BookTicker]:
@@ -84,8 +86,27 @@ class ExecutionLayer:
         bid = book.bid
         # maker price = bid - offset
         px = bid * (1.0 - max(0.0, self.maker_offset_bps) / 10000.0)
-        log.debug("entry: try maker LIMIT price=%.8f", px)
-        lim = self._place_limit(symbol=symbol, side="BUY", price=px, size=0.0, client_order_id=client_order_id)
+        # compute size from amount (Pionex LIMIT requires size)
+        size = max(0.0, amount_usdt / max(px, 1e-12))
+        # apply symbol constraints if available
+        try:
+            rules = self.symbol_rules.get(symbol.upper()) or self.symbol_rules.get(self.client._normalize_symbol(symbol)) or {}
+            min_size = float(rules.get("minTradeSize")) if rules.get("minTradeSize") is not None else None
+            max_size = float(rules.get("maxTradeSize")) if rules.get("maxTradeSize") is not None else None
+            # amountPrecision is for MARKET amount; basePrecision is qty precision
+            base_prec = int(rules.get("basePrecision", 6)) if rules.get("basePrecision") is not None else 6
+            # round down to base precision
+            if base_prec >= 0:
+                factor = 10 ** base_prec
+                size = (int(size * factor)) / factor
+            if min_size is not None and size < min_size:
+                size = min_size
+            if max_size is not None and size > max_size:
+                size = max_size
+        except Exception:
+            pass
+        log.debug("entry: try maker LIMIT price=%.8f size=%.8f", px, size)
+        lim = self._place_limit(symbol=symbol, side="BUY", price=px, size=size, client_order_id=client_order_id)
         log.debug("entry.limit resp ok=%s data=%s err=%s", lim.get('ok'), lim.get('data'), lim.get('error'))
         if lim.get("ok"):
             # wait fill with timeout (poll using get_order when client supports it)
