@@ -19,6 +19,8 @@ pionex_futures_bot/.env
 *.log
 *.pid
 pionex_futures_bot/logs/*
+pionex_futures_bot/spot/logs/*
+pionex_futures_bot/spot2/logs/*
 
 # Data/outputs generated at runtime
 nohup.out

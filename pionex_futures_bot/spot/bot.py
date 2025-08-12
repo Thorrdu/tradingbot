@@ -37,7 +37,7 @@ class _ImportantOnlyFilter(logging.Filter):
 
 from dotenv import load_dotenv
 
-from pionex_futures_bot.clients import PionexClient
+# Client sera importé depuis le sous-module spot/clients dans __init__
 from pionex_futures_bot.common.strategy import (
     compute_breakout_signal,
     compute_sl_tp_prices,
@@ -94,7 +94,12 @@ class SpotBot:
         api_key = os.getenv("API_KEY", "")
         api_secret = os.getenv("API_SECRET", "")
 
-        self.client = PionexClient(
+        # Client dédié au bot spot
+        try:
+            from .clients.pionex_client import PionexClient as SpotClient  # type: ignore
+        except Exception:
+            from .clients.pionex_client import PionexClient as SpotClient  # type: ignore
+        self.client = SpotClient(
             api_key=api_key,
             api_secret=api_secret,
             base_url=self.config["base_url"],
@@ -103,7 +108,7 @@ class SpotBot:
 
         # File logging into logs/ directory
         try:
-            logs_dir = Path(self.config.get("log_dir", "logs"))
+            logs_dir = Path(self.config.get("log_dir", "spot/logs"))
             logs_dir.mkdir(parents=True, exist_ok=True)
             log_file = logs_dir / ("bot_dryrun.log" if bool(self.config.get("dry_run", True)) else "bot.log")
             fh = TimedRotatingFileHandler(str(log_file), when="midnight", backupCount=7, encoding="utf-8")
@@ -125,7 +130,7 @@ class SpotBot:
         try:
             from pathlib import Path as _P
             import json as _J
-            sym_cache = _P("config/symbols.json")
+            sym_cache = _P("spot/config/symbols.json")
             if sym_cache.exists():
                 cache = _J.loads(sym_cache.read_text(encoding="utf-8"))
                 cache_syms = {str(s.get("symbol", "")).upper() for s in cache.get("symbols", []) if isinstance(s, dict)}
@@ -273,8 +278,8 @@ class SpotBot:
             from pathlib import Path as _P
             import json as _J
             cache_paths = [
-                _P("config/symbols_spot.json"),
-                _P("config/symbols.json"),
+                _P("spot/config/symbols_spot.json"),
+                _P("spot/config/symbols.json"),
             ]
             loaded = False
             for p in cache_paths:

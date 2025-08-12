@@ -1,0 +1,64 @@
+{
+  "base_url": "https://api.pionex.com",
+  "symbols": [
+    "SOL_USDT",
+    "ETH_USDT",
+    "BTC_USDT",
+    "NEAR_USDT",
+    "TON_USDT",
+    "SUI_USDT",
+    "DOGE_USDT",
+    "XRP_USDT"
+  ],
+  "leverage": 1,
+  "position_usdt": 25,
+  "max_open_trades": 5,
+  "max_open_trades_per_symbol": 1,
+  "breakout_change_percent": 0.35,
+  "ewm_lambda": 0.94,
+  "z_threshold_contrarian": 2.6,
+  "z_threshold_momentum": 2.1,
+  
+  "trailing_enabled": true,
+  "trailing_activation_gain_percent": 2.0,
+  "trailing_retrace_percent": 0.25,
+  "trailing_atr_mult": 1.0,
+  
+  "micro_trailing_enabled": true,
+  "micro_trailing_activation_gain_percent": 0.40,
+  "micro_trailing_retrace_percent": 0.12,
+  "gain_trailing_enabled": true,
+  "gain_trailing_activation_percent": 0.60,
+  "gain_trailing_giveback_percent": 0.10,
+  "breakout_lookback_sec": 60,
+  "breakout_confirm_ticks": 2,
+  "min_hold_sec": 25,
+  "exit_hysteresis_percent": 0.10,
+  "stop_loss_percent": 2.0,
+  "take_profit_percent": 3.0,
+  "check_interval_sec": 4,
+  
+  "cooldown_sec": 300,
+  "idle_backoff_sec": 24,
+  "force_min_sell": true,
+  
+  "prefer_maker": true,
+  "maker_offset_bps": 2.0,
+  "entry_limit_timeout_sec": 3,
+  "exit_limit_timeout_sec": 2,
+  "exit_maker_for_tp": true,
+  "exit_maker_for_trailing": true,
+  "entry_max_spread_bps": 3.0,
+  
+  "dynamic_z_enabled": true,
+  "dynamic_z_percentile": 0.7,
+  "verify_after_trade": true,
+  "dry_run": true,
+  "log_dir": "spot2/logs",
+  "log_csv": "spot2/logs/trades.csv",
+  "summary_csv": "spot2/logs/trades_summary.csv",
+  "state_file": "spot2/logs/runtime_state.json"
+}
+  
+  
+  

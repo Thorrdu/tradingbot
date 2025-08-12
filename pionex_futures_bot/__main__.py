@@ -55,8 +55,21 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_spot = sub.add_parser("spot", help="Démarrer le bot Spot")
-    p_spot.add_argument("--config", default="config/config.json", help="Chemin du fichier de configuration Spot")
+    p_spot.add_argument("--config", default="spot/config/config.json", help="Chemin du fichier de configuration Spot")
     p_spot.add_argument("--print-config", action="store_true", help="Affiche un exemple de configuration et sort")
+
+    # Nouveau bot spot2 (expérimental)
+    p_spot2 = sub.add_parser("spot2", help="Démarrer le bot Spot v2 (maker + filtres + z dynamique)")
+    p_spot2.add_argument("--config", default="spot2/config/config.json", help="Chemin du fichier de configuration Spot2")
+    p_spot2.add_argument("--print-config", action="store_true", help="Affiche un exemple de configuration et sort")
+    # Monitoring CLI pour spot2
+    p_spot2mon = sub.add_parser("spot2-monitor", help="Dashboard et monitoring du bot Spot v2 (rich)")
+    p_spot2mon.add_argument("--summary", default="spot2/logs/trades_summary.csv", help="CSV de synthèse des trades")
+    p_spot2mon.add_argument("--state", default="spot2/logs/runtime_state.json", help="Fichier d'état runtime")
+    p_spot2mon.add_argument("--trades", default="spot2/logs/trades.csv", help="CSV détaillé des événements")
+    p_spot2mon.add_argument("--interval", type=int, default=2, help="Intervalle de rafraîchissement (s)")
+    p_spot2mon.add_argument("--view", choices=["dashboard","pairs","positions","trades","reasons","alerts"], default="dashboard", help="Vue initiale")
+    p_spot2mon.add_argument("--window-trades", type=int, default=30, help="Fenêtre de trades pour les statistiques/alertes")
 
     p_utils = sub.add_parser("symbols", help="Fetch and store market symbols (SPOT/PERP)")
     p_utils.add_argument("--type", choices=["SPOT", "PERP"], help="Market type to fetch")
@@ -72,7 +85,8 @@ def main() -> None:
     p_stats.add_argument("--watch", action="store_true", help="Auto-refresh view with open positions and totals")
     p_stats.add_argument("--state", default="logs/runtime_state.json", help="Path to runtime state JSON (default: logs/runtime_state.json)")
     p_stats.add_argument("--interval", type=int, default=3, help="Refresh interval in seconds for --watch")
-    p_stats.add_argument("--base-url", default=os.getenv("PIONEX_BASE_URL", "https://api.pionex.com"), help="API base URL for price lookups")
+    import os as _os
+    p_stats.add_argument("--base-url", default=_os.getenv("PIONEX_BASE_URL", "https://api.pionex.com"), help="API base URL for price lookups")
 
     args = parser.parse_args()
 
@@ -81,8 +95,465 @@ def main() -> None:
             _print_config_example("spot")
             return
         _run_spot(args.config)
+    elif args.cmd == "spot2":
+        if args.print_config:
+            _print_config_example("spot")
+            return
+        # Lancement du nouveau bot
+        _chdir_to_project_root()
+        from pionex_futures_bot.spot2.bot import SpotBotV2
+        bot = SpotBotV2(config_path=args.config)
+        bot.run()
+    elif args.cmd == "spot2-monitor":
+        # CLI monitoring riche
+        _chdir_to_project_root()
+        try:
+            from rich.live import Live
+            from rich.table import Table
+            from rich.layout import Layout
+            from rich.panel import Panel
+            from rich.console import Console
+            from rich.align import Align
+        except Exception:
+            print("Installez 'rich' pour le monitoring: pip install rich")
+            return
+        from datetime import datetime
+        import time
+        import csv, json as _J
+        summary_path = Path(args.summary)
+        state_path = Path(args.state)
+        trades_path = Path(args.trades)
+        # API client for live price lookups (read-only, dry-run)
+        try:
+            from pionex_futures_bot.spot2.clients.pionex_client import PionexClient as _MonClient  # type: ignore
+        except Exception:
+            from pionex_futures_bot.spot.clients.pionex_client import PionexClient as _MonClient  # type: ignore
+        mon_client = _MonClient(api_key=os.getenv("API_KEY",""), api_secret=os.getenv("API_SECRET",""), base_url=os.getenv("PIONEX_BASE_URL","https://api.pionex.com"), dry_run=True)
+
+        def fmt_dur(s: float) -> str:
+            s = max(0.0, float(s))
+            m, sec = divmod(int(s), 60)
+            h, m = divmod(m, 60)
+            return f"{h}h{m:02}m{sec:02}s" if h else (f"{m}m{sec:02}s" if m else f"{sec}s")
+
+        def load_summary():
+            stats = {"n":0,"wins":0,"losses":0,"be":0,"total":0.0}
+            pairs = {}
+            recent: list[dict[str, str]] = []
+            reasons: dict[str,int] = {}
+            # Pour les alertes: fenêtre des N derniers trades globaux
+            window = max(1, int(getattr(args, "window_trades", 30)))
+            window_rows: list[dict[str,str]] = []
+            try:
+                with summary_path.open("r", encoding="utf-8") as f:
+                    r = csv.DictReader(f)
+                    rows = list(r)
+                    for row in rows:
+                        sym = (row.get("symbol") or "").strip()
+                        pnl = float(row.get("pnl_usdt") or 0.0)
+                        stats["n"] += 1
+                        stats["total"] += pnl
+                        if pnl>0: stats["wins"] += 1
+                        elif pnl<0: stats["losses"] += 1
+                        else: stats["be"] += 1
+                        reasons[row.get("exit_reason","UNKNOWN")] = reasons.get(row.get("exit_reason","UNKNOWN"),0)+1
+                        d = pairs.setdefault(sym,{"trades":0,"pnl":0.0,"wins":0})
+                        d["trades"] += 1; d["pnl"] += pnl; d["wins"] += (1 if pnl>0 else 0)
+                    # last 10 by exit_ts
+                    def _key(rr):
+                        try:
+                            return datetime.fromisoformat((rr.get("exit_ts") or "").replace("Z",""))
+                        except Exception:
+                            return datetime.min
+                    rows.sort(key=_key)
+                    recent = rows[-10:]
+                    window_rows = rows[-window:]
+            except Exception:
+                pass
+            return stats, pairs, recent, reasons, window_rows
+
+        def load_state():
+            try:
+                if state_path.exists():
+                    return _J.loads(state_path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                return {}
+            return {}
+
+        def filter_pairs(pairs: dict[str, dict], sym: str | None) -> dict[str, dict]:
+            if sym:
+                return {k: v for k, v in pairs.items() if k == sym}
+            return pairs
+
+        def filter_state(state: dict[str, dict], sym: str | None) -> dict[str, dict]:
+            if sym:
+                return {k: v for k, v in state.items() if k == sym}
+            return state
+
+        def shortcuts_footer(current_symbol: str | None) -> Align:
+            suf = f" | Filtre: {current_symbol}" if current_symbol else ""
+            txt = "Raccourcis: Dashboard (d)  Pairs (p)  Positions (o)  Trades (t)  Reasons (r)  Alerts (a)  Control (c)  Filter (f)  Clear (F)  Quit (q)" + suf
+            return Align.center(txt, vertical="middle")
+
+        def render_dashboard():
+            stats, pairs, recent, reasons, _ = load_summary()
+            state = load_state()
+            # Top panel
+            top = Table.grid()
+            wr = (stats["wins"]/stats["n"]*100.0) if stats["n"] else 0.0
+            top.add_row(f"Trades: {stats['n']}  Wins: {stats['wins']}  Losses: {stats['losses']}  BE: {stats['be']}  Winrate: {wr:.2f}%")
+            top.add_row(f"PnL total: {stats['total']:.4f} USDT")
+            # Pairs: mode compact ou tableau
+            pairs_use = filter_pairs(pairs, getattr(args, 'symbol', None)) or {}
+            if getattr(args, 'compact', False):
+                grid = Table.grid(expand=True)
+                grid.add_column(ratio=1); grid.add_column(ratio=1); grid.add_column(ratio=1)
+                tiles = []
+                # Construire un set de symboles pertinent
+                sym_set = set(pairs_use.keys()) | set(load_state().keys())
+                syms = sorted(sym_set)
+                for sym in syms:
+                    d = pairs.get(sym, {"trades":0,"wins":0,"pnl":0.0})
+                    t = int(d.get('trades',0)); w=int(d.get('wins',0)); pnl=float(d.get('pnl',0.0))
+                    wr = (w/t*100.0) if t else 0.0
+                    ev = (pnl/t) if t else 0.0
+                    tbl = Table(show_header=False, box=None)
+                    tbl.add_row("Trades:", str(t))
+                    tbl.add_row("Winrate:", f"{wr:.1f}%")
+                    tbl.add_row("EV/trade:", f"{ev:.4f}")
+                    tbl.add_row("Total:", f"{pnl:.4f}")
+                    tiles.append(Panel(tbl, title=f"{sym}"))
+                row = []
+                for i,p in enumerate(tiles,1):
+                    row.append(p)
+                    if len(row)==3:
+                        grid.add_row(*row); row=[]
+                if row:
+                    while len(row)<3: row.append(Panel(""))
+                    grid.add_row(*row)
+                tbl_pairs = grid
+            else:
+                tbl_pairs = Table(title="Pairs", header_style="bold green")
+                tbl_pairs.add_column("Symbol")
+                tbl_pairs.add_column("Trades", justify="right")
+                tbl_pairs.add_column("Winrate", justify="right")
+                tbl_pairs.add_column("EV/trade", justify="right")
+                tbl_pairs.add_column("Total", justify="right")
+                for sym,d in sorted(pairs_use.items(), key=lambda kv: (-kv[1]['pnl'], kv[0])):
+                    t = d['trades']; wrp = (d['wins']/t*100.0) if t else 0.0
+                    ev = (d['pnl']/t) if t else 0.0
+                    tbl_pairs.add_row(sym, str(t), f"{wrp:.1f}%", f"{ev:.4f}", f"{d['pnl']:.4f}")
+            # Open positions
+            tbl_pos = Table(title="Positions ouvertes", header_style="bold yellow")
+            tbl_pos.add_column("Symbol")
+            tbl_pos.add_column("Side")
+            tbl_pos.add_column("Qty", justify="right")
+            tbl_pos.add_column("Entry", justify="right")
+            tbl_pos.add_column("Price", justify="right")
+            tbl_pos.add_column("Value", justify="right")
+            tbl_pos.add_column("PnL", justify="right")
+            tbl_pos.add_column("PnL %", justify="right")
+            tbl_pos.add_column("SL", justify="right")
+            tbl_pos.add_column("SL %", justify="right")
+            tbl_pos.add_column("TP", justify="right")
+            tbl_pos.add_column("TP %", justify="right")
+            tbl_pos.add_column("Trail stop", justify="right")
+            tbl_pos.add_column("Trail %", justify="right")
+            tbl_pos.add_column("Peak %", justify="right")
+            tbl_pos.add_column("Hold", justify="right")
+            open_count = 0
+            for sym, st in sorted(filter_state(state, getattr(args,'symbol', None)).items()):
+                if not isinstance(st, dict) or not st.get("in_position"): continue
+                open_count += 1
+                try:
+                    from datetime import timezone as _tz
+                    now_ts = datetime.now(_tz.utc).timestamp()
+                except Exception:
+                    now_ts = datetime.utcnow().timestamp()
+                hold = fmt_dur(max(0.0, (now_ts - float(st.get("entry_time",0.0))))) if st.get("entry_time") else "-"
+                # Live price
+                pr_val = None
+                try:
+                    r = mon_client.get_price(sym)
+                    if r.ok and r.data and "price" in r.data:
+                        pr_val = float(r.data["price"])  # type: ignore[arg-type]
+                except Exception:
+                    pr_val = None
+                entry = float(st.get('entry_price',0.0))
+                qty = float(st.get('quantity',0.0))
+                val_usdt = 0.0; pnl_usdt = 0.0; pnl_pct = 0.0
+                if pr_val and entry:
+                    val_usdt = pr_val * qty
+                    pnl_usdt = (pr_val - entry) * qty if (st.get('side') or 'BUY') == 'BUY' else (entry - pr_val) * qty
+                    pnl_pct = ((pr_val - entry)/entry*100.0) if (st.get('side') or 'BUY') == 'BUY' else ((entry - pr_val)/entry*100.0)
+                try:
+                    peak_pct = 0.0
+                    if entry>0 and float(st.get('max_price_since_entry',0.0))>0:
+                        peak_pct = (float(st.get('max_price_since_entry')) - entry) / entry * 100.0
+                except Exception:
+                    peak_pct = 0.0
+                # SL/TP percent from entry and trailing stop
+                sl = float(st.get('stop_loss',0.0)); tp = float(st.get('take_profit',0.0))
+                sl_pct = ((sl/entry - 1.0)*100.0) if entry>0 and sl>0 else 0.0
+                tp_pct = ((tp/entry - 1.0)*100.0) if entry>0 and tp>0 else 0.0
+                # Derive trailing stop from peak and retrace config if applicable
+                trail_stop = 0.0; trail_pct = 0.0
+                try:
+                    from json import loads as _loads
+                    cfg = _J.loads(Path('pionex_futures_bot/spot2/config/config.json').read_text(encoding='utf-8')) if Path('pionex_futures_bot/spot2/config/config.json').exists() else {}
+                    retrace = float(cfg.get('trailing_retrace_percent', 0.25))
+                    peak_px = float(st.get('max_price_since_entry', 0.0))
+                    if peak_px > 0:
+                        trail_stop = peak_px * (1.0 - retrace/100.0)
+                        if entry>0:
+                            trail_pct = (trail_stop/entry - 1.0)*100.0
+                except Exception:
+                    trail_stop = 0.0; trail_pct = 0.0
+                tbl_pos.add_row(
+                    sym,
+                    str(st.get("side","")),
+                    f"{qty:.6f}",
+                    f"{entry:.6f}",
+                    f"{(pr_val if pr_val is not None else 0.0):.6f}",
+                    f"{val_usdt:.2f}",
+                    f"{pnl_usdt:.4f}",
+                    f"{pnl_pct:.2f}%",
+                    f"{sl:.6f}",
+                    f"{sl_pct:.2f}%",
+                    f"{tp:.6f}",
+                    f"{tp_pct:.2f}%",
+                    f"{trail_stop:.6f}",
+                    f"{trail_pct:.2f}%",
+                    f"{peak_pct:.2f}%",
+                    hold,
+                )
+            # Recent trades
+            tbl_last = Table(title="Derniers trades", header_style="bold cyan")
+            tbl_last.add_column("Exit time")
+            tbl_last.add_column("Symbol")
+            tbl_last.add_column("Side")
+            tbl_last.add_column("PnL", justify="right")
+            tbl_last.add_column("Hold", justify="right")
+            for row in recent:
+                try:
+                    pnl = float(row.get("pnl_usdt") or 0.0)
+                    hold = float(row.get("hold_sec") or 0.0)
+                except Exception:
+                    pnl = 0.0; hold = 0.0
+                tbl_last.add_row(str(row.get("exit_ts")), str(row.get("symbol")), str(row.get("side")), f"{pnl:.4f}", fmt_dur(hold))
+            # Layout
+            lay = Layout()
+            lay.split_column(
+                Layout(Panel(top, title="Spot2 Totaux", style="bold cyan"), size=5),
+                Layout(tbl_pos, size=10),
+                Layout(tbl_pairs, ratio=1),
+                Layout(tbl_last, size=10),
+                Layout(shortcuts_footer(getattr(args,'symbol',None)), size=1),
+            )
+            return lay
+
+        def render_pairs_only():
+            _, pairs, _, _, _ = load_summary()
+            tbl = Table(title="Pairs - détails", header_style="bold green")
+            tbl.add_column("Symbol"); tbl.add_column("Trades", justify="right"); tbl.add_column("Wins", justify="right"); tbl.add_column("Winrate", justify="right"); tbl.add_column("EV/trade", justify="right"); tbl.add_column("Total", justify="right")
+            for sym,d in sorted(pairs.items(), key=lambda kv: (-kv[1]['pnl'], kv[0])):
+                t=d['trades']; w=d['wins']; wr=(w/t*100.0) if t else 0.0; ev=(d['pnl']/t) if t else 0.0
+                tbl.add_row(sym, str(t), str(w), f"{wr:.2f}%", f"{ev:.4f}", f"{d['pnl']:.4f}")
+            return Layout(Panel(tbl, title="Pairs"))
+
+        def render_positions_only():
+            state = load_state()
+            tbl = Table(title="Positions ouvertes", header_style="bold yellow")
+            tbl.add_column("Symbol"); tbl.add_column("Side"); tbl.add_column("Qty", justify="right"); tbl.add_column("Entry", justify="right"); tbl.add_column("Price", justify="right"); tbl.add_column("Value", justify="right"); tbl.add_column("PnL", justify="right"); tbl.add_column("PnL %", justify="right"); tbl.add_column("SL", justify="right"); tbl.add_column("SL %", justify="right"); tbl.add_column("TP", justify="right"); tbl.add_column("TP %", justify="right"); tbl.add_column("Peak %", justify="right"); tbl.add_column("Hold", justify="right")
+            for sym, st in sorted(state.items()):
+                if not isinstance(st, dict) or not st.get("in_position"): continue
+                try:
+                    from datetime import timezone as _tz
+                    now_ts = datetime.now(_tz.utc).timestamp()
+                except Exception:
+                    now_ts = datetime.utcnow().timestamp()
+                hold = fmt_dur(max(0.0, (now_ts - float(st.get("entry_time",0.0))))) if st.get("entry_time") else "-"
+                pr_val = None
+                try:
+                    r = mon_client.get_price(sym)
+                    if r.ok and r.data and "price" in r.data:
+                        pr_val = float(r.data["price"])  # type: ignore[arg-type]
+                except Exception:
+                    pr_val = None
+                entry = float(st.get('entry_price',0.0)); qty = float(st.get('quantity',0.0))
+                val_usdt = 0.0; pnl_usdt = 0.0; pnl_pct = 0.0
+                if pr_val and entry:
+                    val_usdt = pr_val * qty
+                    pnl_usdt = (pr_val - entry) * qty if (st.get('side') or 'BUY') == 'BUY' else (entry - pr_val) * qty
+                    pnl_pct = ((pr_val - entry)/entry*100.0) if (st.get('side') or 'BUY') == 'BUY' else ((entry - pr_val)/entry*100.0)
+                sl = float(st.get('stop_loss',0.0)); tp = float(st.get('take_profit',0.0))
+                sl_pct = ((sl/entry - 1.0)*100.0) if entry>0 and sl>0 else 0.0
+                tp_pct = ((tp/entry - 1.0)*100.0) if entry>0 and tp>0 else 0.0
+                try:
+                    peak_pct = 0.0
+                    if entry>0 and float(st.get('max_price_since_entry',0.0))>0:
+                        peak_pct = (float(st.get('max_price_since_entry')) - entry) / entry * 100.0
+                except Exception:
+                    peak_pct = 0.0
+                tbl.add_row(sym, str(st.get("side","")), f"{qty:.6f}", f"{entry:.6f}", f"{(pr_val if pr_val is not None else 0.0):.6f}", f"{val_usdt:.2f}", f"{pnl_usdt:.4f}", f"{pnl_pct:.2f}%", f"{sl:.6f}", f"{sl_pct:.2f}%", f"{tp:.6f}", f"{tp_pct:.2f}%", f"{peak_pct:.2f}%", hold)
+            return Layout(Panel(tbl, title="Positions"))
+
+        def render_trades_only():
+            _, _, recent, _, _ = load_summary()
+            tbl = Table(title="Derniers trades", header_style="bold cyan")
+            tbl.add_column("Exit time"); tbl.add_column("Symbol"); tbl.add_column("Side"); tbl.add_column("PnL", justify="right"); tbl.add_column("Hold", justify="right"); tbl.add_column("Reason")
+            for row in recent:
+                try:
+                    pnl = float(row.get("pnl_usdt") or 0.0); hold = float(row.get("hold_sec") or 0.0)
+                except Exception:
+                    pnl = 0.0; hold = 0.0
+                tbl.add_row(str(row.get("exit_ts")), str(row.get("symbol")), str(row.get("side")), f"{pnl:.4f}", fmt_dur(hold), str(row.get("exit_reason")))
+            return Layout(Panel(tbl, title="Trades"))
+
+        def render_reasons_only():
+            _, _, _, reasons, _ = load_summary()
+            tbl = Table(title="Sorties par raison", header_style="bold magenta")
+            tbl.add_column("Reason"); tbl.add_column("Count", justify="right")
+            for k,v in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0])):
+                tbl.add_row(str(k), str(v))
+            out = Layout(); out.split_column(Layout(Panel(tbl, title="Exit reasons"), ratio=1), Layout(shortcuts_footer(getattr(args,'symbol',None)), size=1))
+            return out
+
+        def render_alerts_only():
+            # Génère des alertes simples sur fenêtre des N derniers trades
+            _, _, _, _, window_rows = load_summary()
+            # Agrégats par paire
+            by_sym: dict[str, dict[str, float]] = {}
+            for row in window_rows:
+                sym = (row.get("symbol") or "").strip()
+                pnl = 0.0
+                try:
+                    pnl = float(row.get("pnl_usdt") or 0.0)
+                except Exception:
+                    pnl = 0.0
+                reason = (row.get("exit_reason") or "").strip() or "UNKNOWN"
+                d = by_sym.setdefault(sym, {"n":0.0, "wins":0.0, "pnl":0.0, "sl":0.0})
+                d["n"] += 1
+                d["pnl"] += pnl
+                if pnl>0: d["wins"] += 1
+                if reason == "SL": d["sl"] += 1
+            # Règles: EV/trade<0 avec n>=5, SL rate>60% si n>=5
+            alerts: list[tuple[str, str, float]] = []  # (symbol, message, score)
+            for sym, d in by_sym.items():
+                n = int(d.get("n",0.0)); wins = float(d.get("wins",0.0)); pnl = float(d.get("pnl",0.0)); slc = float(d.get("sl",0.0))
+                if n >= 5:
+                    ev = pnl / n if n else 0.0
+                    wr = wins / n * 100.0
+                    slr = slc / n * 100.0
+                    if ev < 0.0:
+                        alerts.append((sym, f"EV/trade négatif ({ev:.4f} USDT)", abs(ev)))
+                    if slr >= 60.0:
+                        alerts.append((sym, f"Taux SL élevé ({slr:.1f}%)", slr))
+                    if wr <= 35.0:
+                        alerts.append((sym, f"Winrate faible ({wr:.1f}%)", 100.0-wr))
+            # Table
+            tbl = Table(title=f"Alerts fenêtre {getattr(args,'window_trades',30)} trades", header_style="bold red")
+            tbl.add_column("Symbol"); tbl.add_column("Alerte"); tbl.add_column("Score", justify="right")
+            for sym, msg, sc in sorted(alerts, key=lambda t: -t[2]):
+                tbl.add_row(sym, msg, f"{sc:.2f}")
+            out = Layout(); out.split_column(Layout(Panel(tbl, title="Alerts"), ratio=1), Layout(shortcuts_footer(getattr(args,'symbol',None)), size=1))
+            return out
+
+            tbl.add_column("Reason"); tbl.add_column("Count", justify="right")
+            for k,v in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0])):
+                tbl.add_row(str(k), str(v))
+            return Layout(Panel(tbl, title="Exit reasons"))
+
+        console = Console()
+        def render_view(current: str):
+            if current == "dashboard":
+                return render_dashboard()
+            if current == "pairs":
+                return render_pairs_only()
+            if current == "positions":
+                return render_positions_only()
+            if current == "trades":
+                return render_trades_only()
+            if current == "reasons":
+                return render_reasons_only()
+            if current == "alerts":
+                return render_alerts_only()
+            return render_dashboard()
+
+        current_view = str(getattr(args, "view", "dashboard"))
+        current_symbol = str(getattr(args, "symbol", "") or "") or None
+        cmd_buffer = ""
+        with Live(render_view(current_view), console=console, refresh_per_second=max(1, int(1/max(0.001, args.interval)))) as live:
+            try:
+                while True:
+                    time.sleep(max(1, int(args.interval)))
+                    # Gestion des entrées clavier (Windows: msvcrt)
+                    try:
+                        import msvcrt  # type: ignore
+                        if msvcrt.kbhit():
+                            ch = msvcrt.getwch()
+                            if not ch:
+                                pass
+                            else:
+                                c = str(ch).lower()
+                                if c == 'q':
+                                    break
+                                elif c == 'd': current_view = 'dashboard'
+                                elif c == 'p': current_view = 'pairs'
+                                elif c == 'o': current_view = 'positions'
+                                elif c == 't': current_view = 'trades'
+                                elif c == 'r': current_view = 'reasons'
+                                elif c == 'a': current_view = 'alerts'
+                                elif c == 'c': current_view = 'control'
+                                elif c == 'f':
+                                    # Prompt simple: tapez le symbole et Enter
+                                    cmd_buffer = ""
+                                    current_view = 'control'
+                                elif c == 'f'.upper():
+                                    current_symbol = None
+                            # Mode contrôle: capture de ligne
+                            if current_view == 'control':
+                                line_chars = []
+                                while msvcrt.kbhit():
+                                    x = msvcrt.getwch()
+                                    if x == '\r':
+                                        break
+                                    line_chars.append(x)
+                                if line_chars:
+                                    cmd_buffer += ''.join(line_chars)
+                                if cmd_buffer.endswith('\n') or cmd_buffer.endswith('\r'):
+                                    cmd_buffer = cmd_buffer.strip()
+                                # Commandes: close:SYMBOL ou filter:SYMBOL
+                                if cmd_buffer.lower().startswith('close:'):
+                                    sym = cmd_buffer.split(':',1)[1].strip().upper()
+                                    st = load_state().get(sym)
+                                    if isinstance(st, dict) and st.get('in_position'):
+                                        try:
+                                            from pionex_futures_bot.spot2.clients.pionex_client import PionexClient as _PC  # type: ignore
+                                        except Exception:
+                                            from pionex_futures_bot.spot.clients.pionex_client import PionexClient as _PC  # type: ignore
+                                        client = _PC(api_key=os.getenv('API_KEY',''), api_secret=os.getenv('API_SECRET',''), base_url=os.getenv('PIONEX_BASE_URL','https://api.pionex.com'), dry_run=True)
+                                        qty = float(st.get('quantity') or 0.0)
+                                        side = str(st.get('side') or 'BUY')
+                                        if qty>0:
+                                            client.close_position(symbol=sym, side=side, quantity=qty)
+                                    cmd_buffer = ""
+                                elif cmd_buffer.lower().startswith('filter:'):
+                                    current_symbol = cmd_buffer.split(':',1)[1].strip().upper()
+                                    setattr(args, 'symbol', current_symbol)
+                                    cmd_buffer = ""
+                    except Exception:
+                        # Environnements non Windows: pas d'inputs, on reste sur --view
+                        pass
+                    live.update(render_view(current_view))
+            except KeyboardInterrupt:
+                return
     elif args.cmd == "symbols":
-        from pionex_futures_bot.clients import PionexClient
+        # Utilise le client de spot2 par défaut pour l'endpoint public
+        try:
+            from pionex_futures_bot.spot2.clients.pionex_client import PionexClient  # type: ignore
+        except Exception:
+            from pionex_futures_bot.spot.clients.pionex_client import PionexClient  # type: ignore
         _chdir_to_project_root()
         client = PionexClient(api_key="", api_secret="", base_url=os.getenv("PIONEX_BASE_URL", "https://api.pionex.com"), dry_run=True)
         resp = client.get_market_symbols(market_type=args.type)
@@ -380,7 +851,7 @@ def main() -> None:
                 return
 
             # Lazy import to avoid heavy deps at top
-            from pionex_futures_bot.clients import PionexClient
+            from pionex_futures_bot.spot2.clients import PionexClient
 
             state_path = Path(args.state)
             client = PionexClient(api_key="", api_secret="", base_url=args.base_url, dry_run=True)

@@ -212,6 +212,30 @@ class PionexClient:
         self.log.error("get_price failed for %s: %s", symbol, last_error)
         return ApiResponse(ok=False, data=None, error=last_error or "unknown_error")
 
+    def get_book_ticker(self, symbol: str) -> ApiResponse:
+        """Return best bid/ask using bookTickers endpoint when possible.
+        Success payload: { "bid": float, "ask": float }
+        """
+        try:
+            self.rate_limiter.wait("ip", weight=1)
+            sym = self._normalize_symbol(symbol)
+            url = f"{self.base_url}/api/v1/market/bookTickers"
+            r = self.session.get(url, params={"symbol": sym}, timeout=self.timeout_sec)
+            if r.status_code != 200:
+                return ApiResponse(ok=False, data=None, error=f"HTTP {r.status_code}: {r.text[:200]}")
+            data = r.json()
+            container = data.get("data") if isinstance(data, dict) else data
+            arr = container.get("tickers") if isinstance(container, dict) else None
+            if isinstance(arr, list) and arr:
+                first = arr[0]
+                bid = float(first.get("bidPrice")) if first.get("bidPrice") is not None else None
+                ask = float(first.get("askPrice")) if first.get("askPrice") is not None else None
+                if bid is not None and ask is not None:
+                    return ApiResponse(ok=True, data={"bid": bid, "ask": ask}, error=None)
+            return ApiResponse(ok=False, data=None, error="unexpected_response")
+        except Exception as exc:  # noqa: BLE001
+            return ApiResponse(ok=False, data=None, error=str(exc))
+
     def get_market_symbols(self, market_type: str | None = None, symbols: list[str] | None = None) -> ApiResponse:
         """Fetch market symbols from Common → Market Data.
 
@@ -346,6 +370,105 @@ class PionexClient:
                 return ApiResponse(ok=True, data=data, error=None)
             except Exception as exc:  # noqa: BLE001
                 return ApiResponse(ok=False, data=None, error=str(exc))
+
+    def place_limit_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        size: float,
+        price: float,
+        client_order_id: Optional[str] = None,
+        ioc: bool = False,
+    ) -> ApiResponse:
+        """Place a LIMIT order. Size is required for both BUY and SELL.
+        Docs: POST /api/v1/trade/order with type=LIMIT, size, price, IOC optional.
+        """
+        if self.dry_run:
+            return ApiResponse(
+                ok=True,
+                data={
+                    "dry_run": True,
+                    "symbol": symbol,
+                    "side": side,
+                    "size": size,
+                    "price": price,
+                    "orderId": str(int(time.time() * 1000)),
+                    "IOC": bool(ioc),
+                },
+                error=None,
+            )
+        self.rate_limiter.wait("ip", weight=1)
+        self.rate_limiter.wait("account", weight=1)
+        path = "/api/v1/trade/order"
+        url = f"{self.base_url}{path}"
+        timestamp_ms = str(int(time.time() * 1000))
+        payload: Dict[str, Any] = {
+            "symbol": self._normalize_symbol(symbol),
+            "side": side.upper(),
+            "type": "LIMIT",
+            "size": str(size),
+            "price": str(price),
+            "IOC": bool(ioc),
+        }
+        if client_order_id:
+            payload["clientOrderId"] = str(client_order_id)
+        query_params = {"timestamp": timestamp_ms}
+        signature = self._build_signature(method="POST", path=path, query_params=query_params, body_str=json.dumps(payload, separators=(",", ":")))
+        headers = {
+            self.api_key_header: self.api_key,
+            "PIONEX-SIGNATURE": signature,
+            "Content-Type": "application/json",
+        }
+        try:
+            self.log.debug("POST %s payload=%s", url, payload)
+            r = self.session.post(url, params=query_params, data=json.dumps(payload), headers=headers, timeout=self.timeout_sec)
+            if r.status_code == 429:
+                return ApiResponse(ok=False, data=None, error="rate_limited")
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and data.get("result") is False:
+                code = data.get("code")
+                message = data.get("message")
+                err = f"{code or ''} {message or ''}".strip()
+                return ApiResponse(ok=False, data=data, error=err or "result_false")
+            return ApiResponse(ok=True, data=data.get("data") if isinstance(data, dict) else data, error=None)
+        except Exception as exc:  # noqa: BLE001
+            return ApiResponse(ok=False, data=None, error=str(exc))
+
+    def get_order(self, *, symbol: str, order_id: str) -> ApiResponse:
+        try:
+            self.rate_limiter.wait("ip", weight=1)
+            self.rate_limiter.wait("account", weight=1)
+            url = f"{self.base_url}/api/v1/trade/order"
+            params = {"symbol": self._normalize_symbol(symbol), "orderId": order_id, "timestamp": str(int(time.time() * 1000))}
+            signature = self._build_signature(method="GET", path="/api/v1/trade/order", query_params=params, body_str=None)
+            headers = {self.api_key_header: self.api_key, "PIONEX-SIGNATURE": signature}
+            r = self.session.get(url, params=params, headers=headers, timeout=self.timeout_sec)
+            if r.status_code != 200:
+                return ApiResponse(ok=False, data=None, error=f"HTTP {r.status_code}: {r.text[:200]}")
+            data = r.json()
+            return ApiResponse(ok=True, data=data.get("data") if isinstance(data, dict) else data, error=None)
+        except Exception as exc:  # noqa: BLE001
+            return ApiResponse(ok=False, data=None, error=str(exc))
+
+    def cancel_order(self, *, symbol: str, order_id: str) -> ApiResponse:
+        try:
+            self.rate_limiter.wait("ip", weight=1)
+            self.rate_limiter.wait("account", weight=1)
+            url = f"{self.base_url}/api/v1/trade/order"
+            payload = {"symbol": self._normalize_symbol(symbol), "orderId": order_id}
+            params = {"timestamp": str(int(time.time() * 1000))}
+            signature = self._build_signature(method="DELETE", path="/api/v1/trade/order", query_params=params, body_str=json.dumps(payload))
+            headers = {self.api_key_header: self.api_key, "PIONEX-SIGNATURE": signature, "Content-Type": "application/json"}
+            r = self.session.delete(url, params=params, data=json.dumps(payload), headers=headers, timeout=self.timeout_sec)
+            if r.status_code != 200:
+                return ApiResponse(ok=False, data=None, error=f"HTTP {r.status_code}: {r.text[:200]}")
+            data = r.json()
+            ok = bool(data.get("result")) if isinstance(data, dict) else True
+            return ApiResponse(ok=ok, data=data, error=None if ok else "cancel_failed")
+        except Exception as exc:  # noqa: BLE001
+            return ApiResponse(ok=False, data=None, error=str(exc))
 
     # ---- Private data helpers -------------------------------------------------
 
