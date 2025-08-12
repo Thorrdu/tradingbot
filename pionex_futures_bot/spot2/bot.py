@@ -153,6 +153,22 @@ class SpotBotV2:
         except Exception:
             pass
 
+        # Log configuration summary (utile pour valider que les paramètres sont bien lus)
+        try:
+            self.log.info(
+                "Spot2 params | min_hold=%ss hysteresis=%.2f%% sl=%.2f%% tp=%.2f%% trailing: act=%.2f%% retrace=%.2f%% maker_tp=%s maker_trail=%s",
+                int(self.config.get("min_hold_sec", 25)),
+                float(self.config.get("exit_hysteresis_percent", 0.10)),
+                float(self.config.get("stop_loss_percent", 2.0)),
+                float(self.config.get("take_profit_percent", 3.0)),
+                float(self.config.get("trailing_activation_gain_percent", 2.0)),
+                float(self.config.get("trailing_retrace_percent", 0.25)),
+                bool(self.config.get("exit_maker_for_tp", True)),
+                bool(self.config.get("exit_maker_for_trailing", True)),
+            )
+        except Exception:
+            pass
+
     # --- Helpers ---
     def _base_asset(self, symbol: str) -> str:
         sym = symbol
@@ -343,13 +359,18 @@ class SpotBotV2:
                 min_hold = int(self.config.get("min_hold_sec", 25))
                 sl_px = st.entry_price * (1.0 - stop_loss_percent / 100.0)
                 tp_px = st.entry_price * (1.0 + take_profit_percent / 100.0)
-                sl_trig = sl_px * (1.0 - hysteresis / 100.0) if elapsed >= min_hold else 0.0
-                tp_trig = tp_px * (1.0 + hysteresis / 100.0) if elapsed >= min_hold else float("inf")
+                # Base seuils et seuils effectifs (activés après min_hold)
+                sl_trig_base = sl_px * (1.0 - hysteresis / 100.0)
+                tp_trig_base = tp_px * (1.0 + hysteresis / 100.0)
+                sl_active = elapsed >= min_hold
+                tp_active = elapsed >= min_hold
+                sl_trig = sl_trig_base if sl_active else 0.0
+                tp_trig = tp_trig_base if tp_active else float("inf")
                 exit_reason = None
                 # Heartbeat/debug for position evaluation
                 try:
                     self.log.debug(
-                        "%s eval: price=%.6f entry=%.6f sl_px=%.6f tp_px=%.6f sl_trig=%.6f tp_trig=%.6f hold=%ds",
+                        "%s eval: price=%.6f entry=%.6f sl_px=%.6f tp_px=%.6f sl_trig=%.6f tp_trig=%.6f hold=%ds sl_active=%s tp_active=%s",
                         symbol,
                         price,
                         st.entry_price,
@@ -358,7 +379,16 @@ class SpotBotV2:
                         sl_trig,
                         tp_trig,
                         int(elapsed),
+                        sl_active,
+                        tp_active,
                     )
+                    if not sl_active or not tp_active:
+                        self.log.debug(
+                            "%s hold gate active: remaining=%ds (min_hold=%ds)",
+                            symbol,
+                            max(0, int(min_hold - elapsed)),
+                            min_hold,
+                        )
                 except Exception:
                     pass
                 # Force close signal from state store (set by monitor)
