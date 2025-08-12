@@ -418,7 +418,8 @@ class PionexClient:
         if client_order_id:
             payload["clientOrderId"] = str(client_order_id)
         query_params = {"timestamp": timestamp_ms}
-        signature = self._build_signature(method="POST", path=path, query_params=query_params, body_str=json.dumps(payload, separators=(",", ":")))
+        body_str = json.dumps(payload, separators=(",", ":"))
+        signature = self._build_signature(method="POST", path=path, query_params=query_params, body_str=body_str)
         headers = {
             self.api_key_header: self.api_key,
             "PIONEX-SIGNATURE": signature,
@@ -426,7 +427,7 @@ class PionexClient:
         }
         try:
             self.log.debug("POST %s payload=%s", url, payload)
-            r = self.session.post(url, params=query_params, data=json.dumps(payload), headers=headers, timeout=self.timeout_sec)
+            r = self.session.post(url, params=query_params, data=body_str, headers=headers, timeout=self.timeout_sec)
             if r.status_code == 429:
                 return ApiResponse(ok=False, data=None, error="rate_limited")
             r.raise_for_status()
