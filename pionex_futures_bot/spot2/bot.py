@@ -104,6 +104,8 @@ class SpotBotV2:
                                    base_url=self.config.get("base_url", os.getenv("PIONEX_BASE_URL", "https://api.pionex.com")),
                                    dry_run=bool(self.config.get("dry_run", True)))
 
+        # Respect config for maker/market behavior (no forcing here)
+
         # Load symbols trading rules (min/max, precisions)
         import json as _J
         from pathlib import Path as _P
@@ -455,10 +457,12 @@ class SpotBotV2:
                             # Ajustement via delta de balance (couvre résidus/fees)
                             post_free = self._get_free_base_balance(symbol)
                             delta_q = max(0.0, post_free - pre_free)
-                            if delta_q > 0 and abs(delta_q - st.quantity) > 1e-12:
-                                self.log.info("%s ENTRY balance adjust: qty %.6f -> %.6f (delta=%+.6f)", symbol, st.quantity, delta_q, delta_q - st.quantity)
-                                st.quantity = delta_q
-                                self.state_store.update_symbol(symbol, {"quantity": st.quantity})
+                            # Only adjust if delta confirms a fill comparable to expected qty
+                            if delta_q > 0:
+                                if abs(delta_q - st.quantity) / max(1e-12, st.quantity) < 0.2 or delta_q > st.quantity * 0.8:
+                                    self.log.info("%s ENTRY balance adjust: qty %.6f -> %.6f (delta=%+.6f)", symbol, st.quantity, delta_q, delta_q - st.quantity)
+                                    st.quantity = delta_q
+                                    self.state_store.update_symbol(symbol, {"quantity": st.quantity})
                         except Exception:
                             pass
                     else:
@@ -469,6 +473,10 @@ class SpotBotV2:
                             data = resp.get("data") if isinstance(resp, dict) else None
                             if isinstance(data, dict):
                                 code = str(data.get("code") or "").upper()
+                            # Log full request context if available
+                            sent = resp.get("_sent") if isinstance(resp, dict) else None
+                            if err_txt or code:
+                                self.log.error("%s ENTRY failed: code=%s err=%s sent=%s", symbol, code, err_txt, sent)
                             if (code and "TRADE_NOT_ENOUGH_MONEY" in code) or ("TRADE_NOT_ENOUGH_MONEY" in err_txt):
                                 self._halt_entries_due_to_funds = True
                                 self.log.error("%s ENTRY halted: TRADE_NOT_ENOUGH_MONEY. Halting all new entries.", symbol)
@@ -674,9 +682,10 @@ class SpotBotV2:
                         # Exit failed; keep position and log details for retry on next tick
                         try:
                             code = exit_resp.get("error") or getattr(exit_resp, "error", None)
+                            sent = exit_resp.get("_sent") if isinstance(exit_resp, dict) else None
                         except Exception:
                             code = None
-                        self.log.error("%s EXIT %s failed, keeping position (err=%s)", symbol, exit_reason, code)
+                        self.log.error("%s EXIT %s failed, keeping position (err=%s, sent=%s)", symbol, exit_reason, code, sent)
                         # If due to notional too small, stop the worker for this symbol to avoid loops
                         if str(code or "").lower().startswith("notional_too_small"):
                             self._halt_reason[symbol] = "exit_blocked_min_notional"

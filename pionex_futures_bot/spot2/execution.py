@@ -138,9 +138,9 @@ class ExecutionLayer:
             r = getattr(self.client, "place_limit_order", None)
             if callable(r):
                 resp = r(symbol=symbol, side=side, size=size, price=price, client_order_id=client_order_id, ioc=False)
-                return {"ok": getattr(resp, "ok", False), "data": getattr(resp, "data", None), "error": getattr(resp, "error", None)}
+                return {"ok": getattr(resp, "ok", False), "data": getattr(resp, "data", None), "error": getattr(resp, "error", None), "_sent": {"symbol": symbol, "side": side, "type": "LIMIT", "size": size, "price": price, "clientOrderId": client_order_id}}
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": str(exc), "_sent": {"symbol": symbol, "side": side, "type": "LIMIT", "size": size, "price": price, "clientOrderId": client_order_id}}
         return {"ok": False, "error": "limit_not_implemented"}
 
     def place_entry(self, *, symbol: str, price_hint: float, amount_usdt: float,
@@ -210,11 +210,31 @@ class ExecutionLayer:
                 if self._wait_filled(symbol=symbol, order_id=order_id, timeout_sec=self.entry_limit_timeout_sec):
                     self._remove_pending(order_id)
                     return lim
-                # Cancel not filled and fallback to market
+                # Not filled within timeout: try to cancel and confirm status to avoid double fills
                 try:
                     cancel = getattr(self.client, "cancel_order", None)
                     if callable(cancel):
                         cancel(symbol=symbol, order_id=order_id)
+                except Exception:
+                    pass
+                # Post-cancel confirmation window: poll for a short period to ensure not filled
+                try:
+                    get_order = getattr(self.client, "get_order", None)
+                    if callable(get_order):
+                        t_confirm = time.time() + 3.0
+                        while time.time() < t_confirm:
+                            time.sleep(0.2)
+                            orr = get_order(symbol=symbol, order_id=order_id)
+                            if getattr(orr, "ok", False) and getattr(orr, "data", None):
+                                data = orr.data  # type: ignore[attr-defined]
+                                status = str(data.get("status", "")).upper()
+                                filled = float(data.get("filledSize", 0.0) or 0.0)
+                                need = float(data.get("size", size) or size)
+                                if status == "CLOSED" or (need > 0 and filled >= need):
+                                    self._remove_pending(order_id)
+                                    return lim
+                                if status == "CANCELED":
+                                    break
                 except Exception:
                     pass
                 self._remove_pending(order_id)
@@ -259,7 +279,7 @@ class ExecutionLayer:
         log.info("exit.market: symbol=%s side=%s qty=%.8f", symbol, side, quantity)
         r = self.client.close_position(symbol=symbol, side=side, quantity=quantity)
         log.debug("exit.market resp ok=%s data=%s err=%s", getattr(r, 'ok', None), getattr(r, 'data', None), getattr(r, 'error', None))
-        return {"ok": r.ok, "data": getattr(r, "data", None), "error": getattr(r, "error", None)}
+        return {"ok": r.ok, "data": getattr(r, "data", None), "error": getattr(r, "error", None), "_sent": {"symbol": symbol, "side": side, "type": "MARKET", "size": quantity}}
 
     # --- Exit attempts with maker LIMIT and timeout fallback ---
     def _wait_filled(self, *, symbol: str, order_id: str, timeout_sec: int) -> bool:

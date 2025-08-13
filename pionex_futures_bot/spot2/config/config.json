@@ -35,12 +35,12 @@
   "idle_backoff_sec": 24,
   "force_min_sell": true,
   
-  "prefer_maker": true,
+  "prefer_maker": false,
   "maker_offset_bps": 2.0,
   "entry_limit_timeout_sec": 3,
   "exit_limit_timeout_sec": 2,
-  "exit_maker_for_tp": true,
-  "exit_maker_for_trailing": true,
+  "exit_maker_for_tp": false,
+  "exit_maker_for_trailing": false,
   "entry_max_spread_bps": 3.0,
   
   "dynamic_z_enabled": true,
