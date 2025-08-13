@@ -554,7 +554,7 @@ def main() -> None:
         current_symbol = str(getattr(args, "symbol", "") or "") or None
         cmd_buffer = ""
         # Reactive refresh: views auto-refresh every args.interval seconds
-        ui_fps = 10
+        ui_fps = 5
         refresh_interval = max(0.5, float(getattr(args, "interval", 2)))
         last_refresh = 0.0
         with Live(render_view(current_view), console=console, refresh_per_second=ui_fps) as live:
