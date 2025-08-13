@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any
 import time
+import json
 
 
 @dataclass
@@ -21,6 +22,91 @@ class ExecutionLayer:
         self.entry_limit_timeout_sec = int(entry_limit_timeout_sec)
         self.exit_limit_timeout_sec = int(exit_limit_timeout_sec)
         self.symbol_rules = symbol_rules or {}
+
+        # Pending maker orders store (JSON) for monitoring UI
+        from pathlib import Path as _P
+        self._pending_path = _P("spot2/logs/pending_orders.json")
+        try:
+            self._pending_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        # Internal cache for symbol rules fetched from API
+        self._rules_cache: Dict[str, dict] = {}
+
+    # ---- Rules resolution ----------------------------------------------------
+    def _resolve_rules(self, symbol: str) -> dict:
+        sym_u = symbol.upper()
+        sym_n = self.client._normalize_symbol(symbol)
+        # Start from provided rules
+        base = dict(self.symbol_rules.get(sym_u) or self.symbol_rules.get(sym_n) or {})
+        # If critical fields missing, try fetch from API once
+        needed = {"basePrecision", "quotePrecision", "minTradeSize", "minAmount", "minTradeAmount", "minNotional"}
+        if not (needed & set(base.keys())):
+            if sym_n in self._rules_cache:
+                base.update(self._rules_cache[sym_n])
+            else:
+                try:
+                    fn = getattr(self.client, "get_market_symbols", None)
+                    if callable(fn):
+                        resp = fn(market_type="SPOT", symbols=[sym_n])
+                        if getattr(resp, "ok", False) and isinstance(getattr(resp, "data", None), dict):
+                            arr = resp.data.get("symbols")  # type: ignore[attr-defined]
+                            if isinstance(arr, list) and arr:
+                                row = arr[0]
+                                parsed = {}
+                                for k in [
+                                    "basePrecision", "quotePrecision", "minTradeSize", "maxTradeSize",
+                                    "minAmount", "minTradeAmount", "minNotional", "tickSize",
+                                ]:
+                                    if k in row:
+                                        parsed[k] = row[k]
+                                self._rules_cache[sym_n] = parsed
+                                base.update(parsed)
+                except Exception:
+                    pass
+        return base
+
+    # ---- Pending orders helpers --------------------------------------------
+    def _load_pending(self) -> dict:
+        try:
+            if self._pending_path.exists():
+                return json.loads(self._pending_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return {}
+
+    def _save_pending(self, data: dict) -> None:
+        try:
+            self._pending_path.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _add_pending(self, *, order_id: str, symbol: str, side: str, kind: str, price: float, size: float, timeout_sec: int) -> None:
+        try:
+            now = time.time()
+            data = self._load_pending()
+            data[str(order_id)] = {
+                "symbol": symbol,
+                "side": side,
+                "kind": kind,  # entry|exit
+                "price": float(price),
+                "size": float(size),
+                "placed_at": now,
+                "timeout_sec": int(timeout_sec),
+            }
+            self._save_pending(data)
+        except Exception:
+            pass
+
+    def _remove_pending(self, order_id: str) -> None:
+        try:
+            data = self._load_pending()
+            if str(order_id) in data:
+                del data[str(order_id)]
+                self._save_pending(data)
+        except Exception:
+            pass
 
     # --- Market data helpers ---
     def get_book_ticker(self, symbol: str) -> Optional[BookTicker]:
@@ -112,13 +198,27 @@ class ExecutionLayer:
         log.debug("entry: try maker LIMIT price=%.8f size=%.8f", px, size)
         lim = self._place_limit(symbol=symbol, side="BUY", price=px, size=size, client_order_id=client_order_id)
         log.debug("entry.limit resp ok=%s data=%s err=%s", lim.get('ok'), lim.get('data'), lim.get('error'))
-        if lim.get("ok"):
-            # wait fill with timeout (poll using get_order when client supports it)
-            t0 = time.time()
-            while time.time() - t0 < max(1, self.entry_limit_timeout_sec):
-                time.sleep(0.2)
-                break
-        # fallback
+        if lim.get("ok") and lim.get("data"):
+            # Track pending and wait fill with timeout
+            order_id = None
+            try:
+                order_id = str(lim["data"].get("orderId"))
+            except Exception:
+                order_id = None
+            if order_id:
+                self._add_pending(order_id=order_id, symbol=symbol, side="BUY", kind="entry", price=px, size=size, timeout_sec=self.entry_limit_timeout_sec)
+                if self._wait_filled(symbol=symbol, order_id=order_id, timeout_sec=self.entry_limit_timeout_sec):
+                    self._remove_pending(order_id)
+                    return lim
+                # Cancel not filled and fallback to market
+                try:
+                    cancel = getattr(self.client, "cancel_order", None)
+                    if callable(cancel):
+                        cancel(symbol=symbol, order_id=order_id)
+                except Exception:
+                    pass
+                self._remove_pending(order_id)
+        # fallback MARKET
         log.debug("entry: fallback MARKET")
         # Ensure amount respects minAmount when available
         try:
@@ -137,7 +237,17 @@ class ExecutionLayer:
         import logging
         log = logging.getLogger("execution")
         try:
-            rules = self.symbol_rules.get(symbol.upper()) or self.symbol_rules.get(self.client._normalize_symbol(symbol)) or {}
+            rules = self._resolve_rules(symbol)
+            # Base precision and minimum trade size enforcement
+            base_prec = int(rules.get("basePrecision", 6)) if rules.get("basePrecision") is not None else 6
+            if base_prec >= 0:
+                factor = 10 ** base_prec
+                quantity = (int(quantity * factor)) / factor
+            min_size = float(rules.get("minTradeSize")) if rules.get("minTradeSize") is not None else None
+            if min_size is not None and quantity < min_size:
+                log.error("exit.market size too small: symbol=%s qty=%.8f < minTradeSize=%.8f", symbol, quantity, float(min_size))
+                return {"ok": False, "error": "size_too_small", "data": None}
+            # Optional dumping limits if provided by rules
             min_dump = float(rules.get("minTradeDumping")) if rules.get("minTradeDumping") is not None else None
             max_dump = float(rules.get("maxTradeDumping")) if rules.get("maxTradeDumping") is not None else None
             if min_dump is not None and quantity < min_dump:
@@ -195,6 +305,54 @@ class ExecutionLayer:
         book = self.get_book_ticker(symbol)
         ask = None if not book else float(book.ask)
         px = max(min_price, (ask or min_price))
+        # Round price/size per rules and enforce min notional and min size
+        try:
+            rules = self._resolve_rules(symbol)
+            quote_prec = int(rules.get("quotePrecision", 6)) if rules.get("quotePrecision") is not None else 6
+            base_prec = int(rules.get("basePrecision", 6)) if rules.get("basePrecision") is not None else 6
+            min_size = float(rules.get("minTradeSize")) if rules.get("minTradeSize") is not None else None
+            # Normalize possible min notional keys from API
+            min_amount = None
+            for key in ("minAmount", "minTradeAmount", "minNotional"):
+                if rules.get(key) is not None:
+                    try:
+                        min_amount = float(rules.get(key))
+                        break
+                    except Exception:
+                        pass
+            if quote_prec >= 0:
+                px = float(f"{px:.{quote_prec}f}")
+            if base_prec >= 0:
+                factor = 10 ** base_prec
+                quantity = (int(quantity * factor)) / factor
+            # Enforce step by minTradeSize: floor to nearest multiple
+            if min_size is not None and min_size > 0:
+                try:
+                    import math as _m
+                    mult = _m.floor(quantity / float(min_size))
+                    quantity = max(0.0, mult * float(min_size))
+                    if base_prec >= 0:
+                        factor = 10 ** base_prec
+                        quantity = (int(quantity * factor)) / factor
+                except Exception:
+                    pass
+            # Check constraints; fallback to MARKET if constraints cannot be met
+            # Use a conservative reference price (min(limit_px, bid)) for notional validation
+            ref_bid = None
+            try:
+                bk = self.get_book_ticker(symbol)
+                ref_bid = None if not bk else float(bk.bid)
+            except Exception:
+                ref_bid = None
+            price_ref = min(px, ref_bid) if (ref_bid is not None) else px
+            if (min_size is not None and quantity < min_size) or (min_amount is not None and (price_ref * quantity) < min_amount):
+                log.info("exit.limit maker -> fallback: constraint not met (qty=%.8f min_size=%s notional=%.8f min_notional=%s)", quantity, str(min_size), px*quantity, str(min_amount))
+                # If even MARKET would fail (ref using bid), surface error
+                if (min_size is not None and quantity < min_size) or (min_amount is not None and (price_ref * quantity) < min_amount):
+                    return {"ok": False, "error": "notional_too_small", "data": {"qty": quantity, "price_ref": price_ref, "min_size": min_size, "min_notional": min_amount}}
+                return self.place_exit_market(symbol=symbol, side="BUY", quantity=quantity)
+        except Exception:
+            pass
         # Place LIMIT SELL
         log.info("exit.limit maker: symbol=%s qty=%.8f px=%.8f timeout=%ss", symbol, quantity, px, self.exit_limit_timeout_sec)
         res = self._place_limit(symbol=symbol, side="SELL", price=px, size=quantity, client_order_id=None)
@@ -206,8 +364,11 @@ class ExecutionLayer:
                 order_id = str(data.get("orderId"))
             except Exception:
                 order_id = None
-            if order_id and self._wait_filled(symbol=symbol, order_id=order_id, timeout_sec=self.exit_limit_timeout_sec):
-                return res
+            if order_id:
+                self._add_pending(order_id=order_id, symbol=symbol, side="SELL", kind="exit", price=px, size=quantity, timeout_sec=self.exit_limit_timeout_sec)
+                if self._wait_filled(symbol=symbol, order_id=order_id, timeout_sec=self.exit_limit_timeout_sec):
+                    self._remove_pending(order_id)
+                    return res
             # Cancel if not filled
             try:
                 cancel = getattr(self.client, "cancel_order", None)
@@ -216,6 +377,8 @@ class ExecutionLayer:
                     cancel(symbol=symbol, order_id=order_id)
             except Exception:
                 pass
+            if order_id:
+                self._remove_pending(order_id)
         # Fallback MARKET close
         log.info("exit.fallback: MARKET close symbol=%s qty=%.8f", symbol, quantity)
         return self.place_exit_market(symbol=symbol, side="BUY", quantity=quantity)

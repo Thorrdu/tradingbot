@@ -327,7 +327,7 @@ def main() -> None:
                     f"{peak_pct:.2f}%",
                     hold,
                 )
-            # Recent trades
+            # Recent trades (panel to the right of pairs)
             tbl_last = Table(title="Derniers trades", header_style="bold cyan")
             tbl_last.add_column("Exit time")
             tbl_last.add_column("Symbol")
@@ -341,15 +341,45 @@ def main() -> None:
                 except Exception:
                     pnl = 0.0; hold = 0.0
                 tbl_last.add_row(str(row.get("exit_ts")), str(row.get("symbol")), str(row.get("side")), f"{pnl:.4f}", fmt_dur(hold))
-            # Layout
+            # Pending maker orders panel (if any)
+            tbl_pend = None
+            try:
+                pend_path = Path("spot2/logs/pending_orders.json")
+                pending = _J.loads(pend_path.read_text(encoding="utf-8")) if pend_path.exists() else {}
+            except Exception:
+                pending = {}
+            if pending:
+                tbl_pend = Table(title="Pending orders (maker)", header_style="bold magenta")
+                tbl_pend.add_column("OID")
+                tbl_pend.add_column("Symbol")
+                tbl_pend.add_column("Side")
+                tbl_pend.add_column("Kind")
+                tbl_pend.add_column("Price", justify="right")
+                tbl_pend.add_column("Size", justify="right")
+                tbl_pend.add_column("ETA", justify="right")
+                now_ts = time.time()
+                # Show up to 8
+                for oid, od in list(pending.items())[:8]:
+                    try:
+                        sym = str(od.get("symbol")); side = str(od.get("side")); kind = str(od.get("kind"))
+                        px = float(od.get("price", 0.0)); sz = float(od.get("size", 0.0))
+                        t0 = float(od.get("placed_at", 0.0)); to = int(od.get("timeout_sec", 0))
+                        eta = max(0, int(t0 + to - now_ts))
+                        tbl_pend.add_row(str(oid), sym, side, kind, f"{px:.6f}", f"{sz:.6f}", f"{eta}s")
+                    except Exception:
+                        continue
+            # Layout: top, positions, then a row with pairs (left) and last trades (right)
             lay = Layout()
             lay.split_column(
                 Layout(Panel(top, title="Spot2 Totaux", style="bold cyan"), size=5),
                 Layout(tbl_pos, size=10),
-                Layout(tbl_pairs, ratio=1),
-                Layout(tbl_last, size=10),
+                Layout(name="row", ratio=1),
                 Layout(shortcuts_footer(getattr(args,'symbol',None)), size=1),
             )
+            if tbl_pend is not None:
+                lay["row"].split_row(Layout(tbl_pairs, ratio=2), Layout(tbl_last, ratio=1), Layout(tbl_pend, ratio=1))
+            else:
+                lay["row"].split_row(Layout(tbl_pairs, ratio=2), Layout(tbl_last, ratio=1))
             return lay
 
         def render_pairs_only():
@@ -359,12 +389,18 @@ def main() -> None:
             for sym,d in sorted(pairs.items(), key=lambda kv: (-kv[1]['pnl'], kv[0])):
                 t=d['trades']; w=d['wins']; wr=(w/t*100.0) if t else 0.0; ev=(d['pnl']/t) if t else 0.0
                 tbl.add_row(sym, str(t), str(w), f"{wr:.2f}%", f"{ev:.4f}", f"{d['pnl']:.4f}")
-            return Layout(Panel(tbl, title="Pairs"))
+            lay = Layout()
+            lay.split_column(Layout(Panel(tbl, title="Pairs"), ratio=1), Layout(shortcuts_footer(getattr(args,'symbol',None)), size=1))
+            return lay
+
+        positions_index_map: dict[str, str] = {}
 
         def render_positions_only():
             state = load_state()
             tbl = Table(title="Positions ouvertes", header_style="bold yellow")
             tbl.add_column("Symbol"); tbl.add_column("Side"); tbl.add_column("Qty", justify="right"); tbl.add_column("Entry", justify="right"); tbl.add_column("Price", justify="right"); tbl.add_column("Value", justify="right"); tbl.add_column("PnL", justify="right"); tbl.add_column("PnL %", justify="right"); tbl.add_column("SL", justify="right"); tbl.add_column("SL %", justify="right"); tbl.add_column("TP", justify="right"); tbl.add_column("TP %", justify="right"); tbl.add_column("Peak %", justify="right"); tbl.add_column("Hold", justify="right")
+            positions_index_map.clear()
+            idx = 1
             for sym, st in sorted(state.items()):
                 if not isinstance(st, dict) or not st.get("in_position"): continue
                 try:
@@ -396,7 +432,39 @@ def main() -> None:
                 except Exception:
                     peak_pct = 0.0
                 tbl.add_row(sym, str(st.get("side","")), f"{qty:.6f}", f"{entry:.6f}", f"{(pr_val if pr_val is not None else 0.0):.6f}", f"{val_usdt:.2f}", f"{pnl_usdt:.4f}", f"{pnl_pct:.2f}%", f"{sl:.6f}", f"{sl_pct:.2f}%", f"{tp:.6f}", f"{tp_pct:.2f}%", f"{peak_pct:.2f}%", hold)
-            return Layout(Panel(tbl, title="Positions"))
+                if idx <= 9:
+                    positions_index_map[str(idx)] = sym
+                    idx += 1
+            # Positions-only footer menu: numeric shortcuts and actions
+            menu = Table.grid()
+            keys = ", ".join(f"[{k}] Close {v}" for k,v in positions_index_map.items()) or "No open positions"
+            menu.add_row(keys)
+            menu.add_row("[0] New BUY (market) — enter: Symbol, Amount (USDT)")
+            menu.add_row("[9] New SELL (market) — enter: Symbol, Quantity (base)")
+            # Pending maker orders (from spot2/logs/pending_orders.json)
+            try:
+                import json as _J
+                pend_path = Path("spot2/logs/pending_orders.json")
+                pending = _J.loads(pend_path.read_text(encoding="utf-8")) if pend_path.exists() else {}
+            except Exception:
+                pending = {}
+            if pending:
+                menu.add_row("Pending maker orders (timeout -> market):")
+                now_ts = time.time()
+                for oid, od in list(pending.items())[:6]:
+                    try:
+                        sym = od.get("symbol"); side = od.get("side"); k = od.get("kind")
+                        px = float(od.get("price", 0.0)); sz = float(od.get("size", 0.0))
+                        t0 = float(od.get("placed_at", 0.0)); to = int(od.get("timeout_sec", 0))
+                        eta = max(0, int(t0 + to - now_ts))
+                        menu.add_row(f"- {oid} | {sym} {side} {k} px={px:.6f} sz={sz:.6f}  ETA={eta}s")
+                    except Exception:
+                        continue
+            menu.add_row("[x] Close by Symbol — enter: Symbol (sets force_close=true)")
+            menu.add_row("[q] Quit | Note: if index [9] exists, [9] closes that position (takes precedence)")
+            lay = Layout()
+            lay.split_column(Layout(Panel(tbl, title="Positions"), ratio=1), Layout(Panel(menu, title="Actions", border_style="cyan"), size=6))
+            return lay
 
         def render_trades_only():
             _, _, recent, _, _ = load_summary()
@@ -408,7 +476,9 @@ def main() -> None:
                 except Exception:
                     pnl = 0.0; hold = 0.0
                 tbl.add_row(str(row.get("exit_ts")), str(row.get("symbol")), str(row.get("side")), f"{pnl:.4f}", fmt_dur(hold), str(row.get("exit_reason")))
-            return Layout(Panel(tbl, title="Trades"))
+            lay = Layout()
+            lay.split_column(Layout(Panel(tbl, title="Trades"), ratio=1), Layout(shortcuts_footer(getattr(args,'symbol',None)), size=1))
+            return lay
 
         def render_reasons_only():
             _, _, _, reasons, _ = load_summary()
@@ -483,68 +553,229 @@ def main() -> None:
         current_view = str(getattr(args, "view", "dashboard"))
         current_symbol = str(getattr(args, "symbol", "") or "") or None
         cmd_buffer = ""
-        with Live(render_view(current_view), console=console, refresh_per_second=max(1, int(1/max(0.001, args.interval)))) as live:
+        # Reactive refresh: views auto-refresh every args.interval seconds
+        ui_fps = 10
+        refresh_interval = max(0.5, float(getattr(args, "interval", 2)))
+        last_refresh = 0.0
+        with Live(render_view(current_view), console=console, refresh_per_second=ui_fps) as live:
             try:
                 while True:
-                    time.sleep(max(1, int(args.interval)))
+                    # Poll keys frequently (every 50ms)
+                    time.sleep(0.05)
+                    c = ''  # reset key each loop
                     # Gestion des entrées clavier (Windows: msvcrt)
                     try:
                         import msvcrt  # type: ignore
                         if msvcrt.kbhit():
                             ch = msvcrt.getwch()
-                            if not ch:
-                                pass
-                            else:
-                                c = str(ch).lower()
-                                if c == 'q':
+                            if ch:
+                                c = str(ch)
+                                c_low = c.lower()
+                                if c_low == 'q':
                                     break
-                                elif c == 'd': current_view = 'dashboard'
-                                elif c == 'p': current_view = 'pairs'
-                                elif c == 'o': current_view = 'positions'
-                                elif c == 't': current_view = 'trades'
-                                elif c == 'r': current_view = 'reasons'
-                                elif c == 'a': current_view = 'alerts'
-                                elif c == 'c': current_view = 'control'
-                                elif c == 'f':
-                                    # Prompt simple: tapez le symbole et Enter
-                                    cmd_buffer = ""
-                                    current_view = 'control'
-                                elif c == 'f'.upper():
-                                    current_symbol = None
-                            # Mode contrôle: capture de ligne
-                            if current_view == 'control':
-                                line_chars = []
-                                while msvcrt.kbhit():
-                                    x = msvcrt.getwch()
-                                    if x == '\r':
-                                        break
-                                    line_chars.append(x)
-                                if line_chars:
-                                    cmd_buffer += ''.join(line_chars)
-                                if cmd_buffer.endswith('\n') or cmd_buffer.endswith('\r'):
-                                    cmd_buffer = cmd_buffer.strip()
-                                # Commandes: close:SYMBOL ou filter:SYMBOL
-                                if cmd_buffer.lower().startswith('close:'):
-                                    sym = cmd_buffer.split(':',1)[1].strip().upper()
-                                    # Ecrire un drapeau force_close dans le fichier d'état pour que le bot clôture au prochain tick
+                                elif c_low == 'd': current_view = 'dashboard'
+                                elif c_low == 'p': current_view = 'pairs'
+                                elif c_low == 'o': current_view = 'positions'
+                                elif c_low == 't': current_view = 'trades'
+                                elif c_low == 'r': current_view = 'reasons'
+                                elif c_low == 'a': current_view = 'alerts'
+                                elif c_low == 'c': current_view = 'control'
+                                elif c_low == 'f':
+                                    # Prompt simple: set filter to a symbol; use last typed buffer if any
                                     try:
-                                        import json as _J
-                                        cur = load_state()
-                                        ent = cur.get(sym, {}) if isinstance(cur, dict) else {}
-                                        ent['force_close'] = True
-                                        cur[sym] = ent
-                                        state_path.write_text(_J.dumps(cur, separators=(',',':')), encoding='utf-8')
+                                        from rich.prompt import Prompt
+                                        sym = Prompt.ask("Filter symbol (empty to keep current)").strip().upper()
+                                        if sym:
+                                            current_symbol = sym
+                                            setattr(args, 'symbol', current_symbol)
                                     except Exception:
                                         pass
-                                    cmd_buffer = ""
-                                elif cmd_buffer.lower().startswith('filter:'):
-                                    current_symbol = cmd_buffer.split(':',1)[1].strip().upper()
-                                    setattr(args, 'symbol', current_symbol)
-                                    cmd_buffer = ""
+                                elif c_low == 'f':
+                                    try:
+                                        from rich.prompt import Prompt
+                                        live.pause()
+                                        sym = Prompt.ask("Filter symbol (empty to keep current)").strip().upper()
+                                        if sym:
+                                            current_symbol = sym
+                                            setattr(args, 'symbol', current_symbol)
+                                    except Exception:
+                                        pass
+                                    finally:
+                                        live.resume()
+                                elif c_low == 'F':
+                                    # Clear filter
+                                    current_symbol = None
+                                    setattr(args, 'symbol', None)
+                                # Positions view numeric actions and 'x'
+                                if current_view == 'positions':
+                                    if '0' <= c <= '9' and c in positions_index_map:
+                                        # Close selected position by force_close flag
+                                        sym = positions_index_map[c]
+                                        try:
+                                            import json as _J
+                                            cur = load_state()
+                                            ent = cur.get(sym, {}) if isinstance(cur, dict) else {}
+                                            # Build confirmation with current state and live price
+                                            side = str(ent.get('side', ''))
+                                            qty = float(ent.get('quantity', 0.0) or 0.0)
+                                            entry = float(ent.get('entry_price', 0.0) or 0.0)
+                                            pr_val = None
+                                            try:
+                                                rpx = mon_client.get_price(sym)
+                                                if rpx.ok and rpx.data and 'price' in rpx.data:
+                                                    pr_val = float(rpx.data['price'])
+                                            except Exception:
+                                                pr_val = None
+                                            from rich.prompt import Confirm
+                                            live.pause()
+                                            msg = f"Close {sym} side={side} qty={qty:.6f} entry={entry:.6f} current={(pr_val if pr_val else 0.0):.6f}. Confirm?"
+                                            ok = Confirm.ask(msg, default=False)
+                                            live.resume()
+                                            if ok:
+                                                ent['force_close'] = True
+                                                cur[sym] = ent
+                                                state_path.write_text(_J.dumps(cur, separators=(',',':')), encoding='utf-8')
+                                                console.log(f"force_close set for {sym}")
+                                            else:
+                                                console.log("Close canceled")
+                                        except Exception as e:
+                                            console.log(f"error setting force_close: {e}")
+                                        live.update(render_view(current_view))
+                                        continue
+                                    elif c == '0':
+                                        # New BUY order (market)
+                                        try:
+                                            from rich.prompt import Prompt, Confirm
+                                            live.pause()
+                                            sym = Prompt.ask("Symbol to BUY (e.g., BTC_USDT)").strip().upper()
+                                            amt = float(Prompt.ask("Amount USDT", default="25").strip())
+                                            # Show live price and estimated qty for confirmation
+                                            pr_val = None
+                                            try:
+                                                rpx = mon_client.get_price(sym)
+                                                if rpx.ok and rpx.data and 'price' in rpx.data:
+                                                    pr_val = float(rpx.data['price'])
+                                            except Exception:
+                                                pr_val = None
+                                            est_qty = (amt / pr_val) if (pr_val and pr_val > 0) else 0.0
+                                            ok = Confirm.ask(f"Confirm BUY MARKET {sym} amount={amt:.2f} (~qty={est_qty:.6f} @ {pr_val or 0.0:.6f})?", default=False)
+                                            live.resume()
+                                            if ok:
+                                                r = mon_client.place_market_order(symbol=sym, side="BUY", amount=amt)
+                                                console.log(f"BUY market {sym} amount={amt} ok={getattr(r,'ok',None)} err={getattr(r,'error',None)}")
+                                            else:
+                                                console.log("BUY canceled")
+                                        except Exception as e:
+                                            console.log(f"BUY error: {e}")
+                                        live.update(render_view(current_view))
+                                        continue
+                                    elif c == '9':
+                                        # New SELL order (market)
+                                        try:
+                                            from rich.prompt import Prompt, Confirm
+                                            live.pause()
+                                            sym = Prompt.ask("Symbol to SELL (e.g., BTC_USDT)").strip().upper()
+                                            qty = float(Prompt.ask("Quantity (base asset)", default="0.001").strip())
+                                            pr_val = None
+                                            try:
+                                                rpx = mon_client.get_price(sym)
+                                                if rpx.ok and rpx.data and 'price' in rpx.data:
+                                                    pr_val = float(rpx.data['price'])
+                                            except Exception:
+                                                pr_val = None
+                                            est_notional = (qty * pr_val) if (pr_val and pr_val > 0) else 0.0
+                                            ok = Confirm.ask(f"Confirm SELL MARKET {sym} qty={qty:.6f} (~notional={est_notional:.2f} @ {pr_val or 0.0:.6f})?", default=False)
+                                            live.resume()
+                                            if ok:
+                                                r = mon_client.place_market_order(symbol=sym, side="SELL", quantity=qty)
+                                                console.log(f"SELL market {sym} qty={qty} ok={getattr(r,'ok',None)} err={getattr(r,'error',None)}")
+                                            else:
+                                                console.log("SELL canceled")
+                                        except Exception as e:
+                                            console.log(f"SELL error: {e}")
+                                        live.update(render_view(current_view))
+                                        continue
+                                    elif c_low == 'x':
+                                        # Close by symbol via prompt (force_close flag)
+                                        try:
+                                            from rich.prompt import Prompt, Confirm
+                                            live.pause()
+                                            sym = Prompt.ask("Symbol to CLOSE (e.g., BTC_USDT)").strip().upper()
+                                            if not sym:
+                                                live.resume(); console.log("No symbol provided")
+                                            else:
+                                                # Load current state for details
+                                                import json as _J
+                                                cur = load_state()
+                                                ent = cur.get(sym, {}) if isinstance(cur, dict) else {}
+                                                side = str(ent.get('side', ''))
+                                                qty = float(ent.get('quantity', 0.0) or 0.0)
+                                                entry = float(ent.get('entry_price', 0.0) or 0.0)
+                                                pr_val = None
+                                                try:
+                                                    rpx = mon_client.get_price(sym)
+                                                    if rpx.ok and rpx.data and 'price' in rpx.data:
+                                                        pr_val = float(rpx.data['price'])
+                                                except Exception:
+                                                    pr_val = None
+                                                msg = f"Close {sym} side={side} qty={qty:.6f} entry={entry:.6f} current={(pr_val if pr_val else 0.0):.6f}. Confirm?"
+                                                ok = Confirm.ask(msg, default=False)
+                                                live.resume()
+                                                if ok:
+                                                    ent['force_close'] = True
+                                                    cur[sym] = ent
+                                                    state_path.write_text(_J.dumps(cur, separators=(',',':')), encoding='utf-8')
+                                                    console.log(f"force_close set for {sym}")
+                                                else:
+                                                    console.log("Close canceled")
+                                        except Exception as e:
+                                            console.log(f"Close by symbol error: {e}")
+                                        live.update(render_view(current_view))
+                                        continue
+                                # Apply view or state change immediately after key
+                                live.update(render_view(current_view))
+                        # Auto refresh based on interval
                     except Exception:
                         # Environnements non Windows: pas d'inputs, on reste sur --view
                         pass
-                    live.update(render_view(current_view))
+                    import time as _t
+                    now_ts = _t.time()
+                    if now_ts - last_refresh >= refresh_interval:
+                        last_refresh = now_ts
+                        live.update(render_view(current_view))
+                    # Mode contrôle: capture de ligne (seulement si vue 'control')
+                    if current_view == 'control':
+                        try:
+                            from rich.prompt import Prompt
+                            live.pause()
+                            cmd = Prompt.ask("Control (commands: close:SYMBOL | filter:SYMBOL | clear)").strip()
+                        except Exception:
+                            cmd = ""
+                        finally:
+                            live.resume()
+                        if cmd:
+                            low = cmd.lower()
+                            if low.startswith('close:'):
+                                sym = cmd.split(':',1)[1].strip().upper()
+                                try:
+                                    import json as _J
+                                    cur = load_state()
+                                    ent = cur.get(sym, {}) if isinstance(cur, dict) else {}
+                                    ent['force_close'] = True
+                                    cur[sym] = ent
+                                    state_path.write_text(_J.dumps(cur, separators=(',',':')), encoding='utf-8')
+                                    console.log(f"force_close set for {sym}")
+                                except Exception as e:
+                                    console.log(f"error setting force_close: {e}")
+                            elif low.startswith('filter:'):
+                                sym = cmd.split(':',1)[1].strip().upper()
+                                current_symbol = sym or None
+                                setattr(args, 'symbol', current_symbol)
+                            elif low in {'clear','clr'}:
+                                current_symbol = None
+                                setattr(args, 'symbol', None)
+
+                    # Auto-refresh disabled: views update only on key actions above
             except KeyboardInterrupt:
                 return
     elif args.cmd == "symbols":

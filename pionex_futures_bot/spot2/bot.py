@@ -39,13 +39,39 @@ class SpotBotV2:
         import json
         self.config_path = config_path
         self.config = json.loads(open(config_path, "r", encoding="utf-8").read())
-        # Logging minimal
+        # Logging to console + file (spot2/logs/bot.log)
         self.log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
         import logging
+        from logging.handlers import TimedRotatingFileHandler
         logging.basicConfig(level=getattr(logging, self.log_level_name, logging.INFO),
                             format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
         self.log = logging.getLogger("spot2")
+        try:
+            from pathlib import Path as _P
+            logs_dir = _P("spot2/logs")
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            formatter = logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+            # File handler
+            fh = TimedRotatingFileHandler(str(logs_dir / "bot.log"), when="midnight", backupCount=7, encoding="utf-8")
+            fh.setLevel(getattr(logging, self.log_level_name, logging.INFO))
+            fh.setFormatter(formatter)
+            # Console handler (default INFO)
+            ch = logging.StreamHandler()
+            ch.setLevel(getattr(logging, self.log_level_name, logging.INFO))
+            ch.setFormatter(formatter)
+            # Attach to both spot2 and execution loggers
+            self.log.addHandler(fh)
+            self.log.addHandler(ch)
+            exec_logger = logging.getLogger("execution")
+            exec_logger.setLevel(getattr(logging, self.log_level_name, logging.INFO))
+            exec_logger.addHandler(fh)
+            exec_logger.addHandler(ch)
+            # Avoid double propagation to root (we provide our own console handler)
+            self.log.propagate = False
+            exec_logger.propagate = False
+        except Exception:
+            pass
 
         # Charger les variables d'environnement depuis .env (racine et dossier module)
         try:
@@ -100,10 +126,20 @@ class SpotBotV2:
             self.client,
             prefer_maker=bool(self.config.get("prefer_maker", True)),
             maker_offset_bps=float(self.config.get("maker_offset_bps", 2.0)),
-            entry_limit_timeout_sec=int(self.config.get("entry_limit_timeout_sec", 3)),
-            exit_limit_timeout_sec=int(self.config.get("exit_limit_timeout_sec", 2)),
+            entry_limit_timeout_sec=int(self.config.get("entry_limit_timeout_sec", 120)),
+            exit_limit_timeout_sec=int(self.config.get("exit_limit_timeout_sec", 60)),
             symbol_rules=self._symbol_rules,
         )
+        try:
+            self.log.info(
+                "Maker settings | prefer_maker=%s offset_bps=%.2f entry_timeout=%ss exit_timeout=%ss",
+                bool(self.config.get("prefer_maker", True)),
+                float(self.config.get("maker_offset_bps", 2.0)),
+                int(self.config.get("entry_limit_timeout_sec", 120)),
+                int(self.config.get("exit_limit_timeout_sec", 60)),
+            )
+        except Exception:
+            pass
 
         # Params
         self.symbols = list(self.config.get("symbols", []))
@@ -134,6 +170,12 @@ class SpotBotV2:
         self._open_trades_lock = threading.Lock()
         self._open_trades_count = 0
         self._symbol_open_count: Dict[str, int] = {s: 0 for s in self.symbols}
+        # Global safety flag: halt entries when insufficient funds detected
+        self._halt_entries_due_to_funds: bool = False
+        self._funds_backoff_sec: int = int(self.config.get("insufficient_funds_backoff_sec", 300))
+        self._funds_last_log_ts: float = 0.0
+        # Per-symbol halt reason (e.g. notional too small to exit)
+        self._halt_reason: Dict[str, str] = {}
         # Initialize state and counters from persisted store to enforce caps immediately
         try:
             persisted = self.state_store.load()
@@ -234,6 +276,14 @@ class SpotBotV2:
         tick = 0
         while True:
             # Si trop de positions sont ouvertes globalement, geler les symboles sans position
+            if self._halt_entries_due_to_funds and not st.in_position:
+                now_ts = time.time()
+                if now_ts - self._funds_last_log_ts >= max(30, self._funds_backoff_sec):
+                    self._funds_last_log_ts = now_ts
+                    self.log.warning("%s idle: entries halted due to insufficient funds (backoff %ss)", symbol, self._funds_backoff_sec)
+                time.sleep(max(self._funds_backoff_sec, self.check_interval_sec))
+                tick += 1
+                continue
             with self._open_trades_lock:
                 open_count = self._open_trades_count
                 max_open = self.max_open_trades
@@ -310,6 +360,56 @@ class SpotBotV2:
                             self._open_trades_count += 1
                             can_enter = True
                 if can_enter:
+                    # Pre-check: ensure that minimum exit constraints are satisfiable given position_usdt
+                    try:
+                        # Resolve rules
+                        rules = self.exec._resolve_rules(symbol)
+                        min_size = float(rules.get("minTradeSize")) if rules.get("minTradeSize") is not None else None
+                        min_notional = None
+                        for k in ("minAmount", "minTradeAmount", "minNotional"):
+                            if rules.get(k) is not None:
+                                try:
+                                    min_notional = float(rules.get(k)); break
+                                except Exception:
+                                    pass
+                        # Compute max sellable qty from intended entry amount at current price
+                        intended_qty = amt / max(price, 1e-12)
+                        # Apply size precision and step
+                        base_prec = int(rules.get("basePrecision", 6)) if rules.get("basePrecision") is not None else 6
+                        if base_prec >= 0:
+                            factor = 10 ** base_prec
+                            intended_qty = (int(intended_qty * factor)) / factor
+                        if min_size is not None and min_size > 0:
+                            import math as _m
+                            mult = _m.floor(intended_qty / float(min_size))
+                            intended_qty = max(0.0, mult * float(min_size))
+                        # Conservative notional check with bid/last
+                        bid_ref = None
+                        try:
+                            bk = self.exec.get_book_ticker(symbol)
+                            bid_ref = None if not bk else float(bk.bid)
+                        except Exception:
+                            bid_ref = None
+                        price_ref = min(price, bid_ref) if (bid_ref is not None) else price
+                        notional_ref = price_ref * intended_qty
+                        if (min_size is not None and intended_qty < min_size) or (min_notional is not None and notional_ref < min_notional):
+                            self._halt_reason[symbol] = "entry_blocked_min_exit"
+                            with self._open_trades_lock:
+                                # rollback reservation
+                                if self._open_trades_count > 0:
+                                    self._open_trades_count -= 1
+                                cur_sym = self._symbol_open_count.get(symbol, 0)
+                                if cur_sym > 0:
+                                    self._symbol_open_count[symbol] = cur_sym - 1
+                            self.log.error(
+                                "%s entry blocked: position_usdt=%.4f would be too small to exit (qty=%.8f min_size=%s notional_ref=%.6f min_notional=%s)",
+                                symbol, amt, intended_qty, str(min_size), notional_ref, str(min_notional)
+                            )
+                            # Stop this worker loop for that symbol
+                            time.sleep(self._funds_backoff_sec)
+                            return
+                    except Exception:
+                        pass
                     # Place maker-preferred entry
                     amt = self.position_usdt
                     pre_free = self._get_free_base_balance(symbol)
@@ -362,6 +462,18 @@ class SpotBotV2:
                         except Exception:
                             pass
                     else:
+                        # Handle specific API error codes
+                        try:
+                            err_txt = str(resp.get("error") or "").upper()
+                            code = None
+                            data = resp.get("data") if isinstance(resp, dict) else None
+                            if isinstance(data, dict):
+                                code = str(data.get("code") or "").upper()
+                            if (code and "TRADE_NOT_ENOUGH_MONEY" in code) or ("TRADE_NOT_ENOUGH_MONEY" in err_txt):
+                                self._halt_entries_due_to_funds = True
+                                self.log.error("%s ENTRY halted: TRADE_NOT_ENOUGH_MONEY. Halting all new entries.", symbol)
+                        except Exception:
+                            pass
                         # Release reservations on failure
                         with self._open_trades_lock:
                             if self._open_trades_count > 0:
@@ -387,6 +499,15 @@ class SpotBotV2:
                 sl_trig = sl_trig_base if sl_active else 0.0
                 tp_trig = tp_trig_base if tp_active else float("inf")
                 exit_reason = None
+                # Pré-calculs conditions pour journalisation claire
+                sl_cond = price <= sl_trig if sl_active else False
+                tp_cond = price >= tp_trig if tp_active else False
+                trail_act_gain = float(self.config.get("trailing_activation_gain_percent", 2.0))
+                trail_retrace = float(self.config.get("trailing_retrace_percent", 0.25))
+                gain_from_entry_pct = (st.max_price_since_entry - st.entry_price) / st.entry_price * 100.0 if st.entry_price > 0 else 0.0
+                trail_activated = gain_from_entry_pct >= trail_act_gain and elapsed >= min_hold and bool(self.config.get("trailing_enabled", True))
+                trail_stop = st.max_price_since_entry * (1.0 - trail_retrace / 100.0) if st.max_price_since_entry > 0 else 0.0
+                trail_cond = price <= trail_stop if trail_activated else False
                 # Heartbeat/debug for position evaluation
                 try:
                     self.log.debug(
@@ -401,6 +522,20 @@ class SpotBotV2:
                         int(elapsed),
                         sl_active,
                         tp_active,
+                    )
+                    # Log synthétique des conditions de sortie attendues vs observées
+                    self.log.debug(
+                        "%s exit_check | SL cond=%s (price<=%.6f) | TP cond=%s (price>=%.6f) | TRAIL act=%s (gain=%.2f%%>=%.2f%%) cond=%s (price<=%.6f)",
+                        symbol,
+                        sl_cond,
+                        sl_trig,
+                        tp_cond,
+                        tp_trig,
+                        trail_activated,
+                        gain_from_entry_pct,
+                        trail_act_gain,
+                        trail_cond,
+                        trail_stop,
                     )
                     if not sl_active or not tp_active:
                         self.log.debug(
@@ -511,23 +646,42 @@ class SpotBotV2:
                             residual_qty = max(0.0, st.quantity - executed_qty)
                     except Exception:
                         pass
-                    self.logger.log(event=f"EXIT_{exit_reason}", symbol=symbol, side=st.side, quantity=st.quantity, price=price, entry_price=st.entry_price, exit_price=price, pnl=pnl, pnl_percent=pnl_percent, reason=exit_reason)
-                    self.log.info("%s EXIT %s qty=%.6f price=%.6f pnl=%.6f (%.2f%%)", symbol, exit_reason, st.quantity, price, pnl, pnl_percent)
-                    self.summary_logger.log_result(symbol=symbol, side=st.side, quantity=st.quantity, executed_qty=executed_qty, residual_qty=residual_qty, entry_price=st.entry_price, exit_price=price, entry_time=st.entry_time, exit_time=now, pnl_usdt=pnl, pnl_percent=pnl_percent, exit_reason=exit_reason)
-                    st.in_position = False
-                    st.side = None
-                    st.quantity = 0.0
-                    st.entry_price = 0.0
-                    st.entry_time = 0.0
-                    st.max_price_since_entry = 0.0
-                    self.state_store.clear_symbol(symbol)
-                    # Release reservations after successful exit
-                    with self._open_trades_lock:
-                        if self._open_trades_count > 0:
-                            self._open_trades_count -= 1
-                        cur_sym = self._symbol_open_count.get(symbol, 0)
-                        if cur_sym > 0:
-                            self._symbol_open_count[symbol] = cur_sym - 1
+                    # Finalize only if the exit action actually succeeded
+                    ok = False
+                    try:
+                        ok = bool(exit_resp.get("ok"))  # type: ignore[attr-defined]
+                    except Exception:
+                        ok = False
+                    if ok:
+                        self.logger.log(event=f"EXIT_{exit_reason}", symbol=symbol, side=st.side, quantity=st.quantity, price=price, entry_price=st.entry_price, exit_price=price, pnl=pnl, pnl_percent=pnl_percent, reason=exit_reason)
+                        self.log.info("%s EXIT %s ok qty=%.6f price=%.6f pnl=%.6f (%.2f%%)", symbol, exit_reason, st.quantity, price, pnl, pnl_percent)
+                        self.summary_logger.log_result(symbol=symbol, side=st.side, quantity=st.quantity, executed_qty=executed_qty, residual_qty=residual_qty, entry_price=st.entry_price, exit_price=price, entry_time=st.entry_time, exit_time=now, pnl_usdt=pnl, pnl_percent=pnl_percent, exit_reason=exit_reason)
+                        st.in_position = False
+                        st.side = None
+                        st.quantity = 0.0
+                        st.entry_price = 0.0
+                        st.entry_time = 0.0
+                        st.max_price_since_entry = 0.0
+                        self.state_store.clear_symbol(symbol)
+                        # Release reservations after successful exit
+                        with self._open_trades_lock:
+                            if self._open_trades_count > 0:
+                                self._open_trades_count -= 1
+                            cur_sym = self._symbol_open_count.get(symbol, 0)
+                            if cur_sym > 0:
+                                self._symbol_open_count[symbol] = cur_sym - 1
+                    else:
+                        # Exit failed; keep position and log details for retry on next tick
+                        try:
+                            code = exit_resp.get("error") or getattr(exit_resp, "error", None)
+                        except Exception:
+                            code = None
+                        self.log.error("%s EXIT %s failed, keeping position (err=%s)", symbol, exit_reason, code)
+                        # If due to notional too small, stop the worker for this symbol to avoid loops
+                        if str(code or "").lower().startswith("notional_too_small"):
+                            self._halt_reason[symbol] = "exit_blocked_min_notional"
+                            self.log.error("%s worker halted: exit blocked by min notional/size", symbol)
+                            return
             st.last_price = price
             time.sleep(self.check_interval_sec)
 
