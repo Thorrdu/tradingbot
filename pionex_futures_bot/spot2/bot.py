@@ -168,6 +168,18 @@ class SpotBotV2:
         self.state_store = StateStore(self.config.get("state_file", "spot2/logs/runtime_state.json"))
         self.logger = TradeLogger(self.config.get("log_csv", "spot2/logs/trades.csv"))
         self.summary_logger = TradeSummaryLogger(self.config.get("summary_csv", "spot2/logs/trades_summary.csv"))
+        # Closed positions snapshot file (for post-mortem analysis)
+        try:
+            from pathlib import Path as _P
+            self._closed_positions_csv = _P(self.config.get("closed_positions_csv", "spot2/logs/closed_positions.csv"))
+            self._closed_positions_csv.parent.mkdir(parents=True, exist_ok=True)
+            if not self._closed_positions_csv.exists():
+                self._closed_positions_csv.write_text(
+                    "time,symbol,side,qty,entry_price,close_price,value_usdt,pnl_usdt,pnl_percent,sl_price,sl_percent,tp_price,tp_percent,trail_stop,trail_percent,peak_percent,hold_sec,reason\n",
+                    encoding="utf-8",
+                )
+        except Exception:
+            self._closed_positions_csv = None
         # Concurrency guards and counters
         self._open_trades_lock = threading.Lock()
         self._open_trades_count = 0
@@ -256,6 +268,37 @@ class SpotBotV2:
         except Exception:
             return 0.0
         return 0.0
+
+    def _record_closed_snapshot(self, *, symbol: str, st: SymbolState, close_price: float, elapsed: float, reason: str) -> None:
+        try:
+            if not self._closed_positions_csv:
+                return
+            import math as _m
+            # Compute derived values similar to monitor
+            qty = float(st.quantity or 0.0)
+            entry = float(st.entry_price or 0.0)
+            value = (close_price or 0.0) * qty
+            pnl_usdt = (close_price - entry) * qty if (st.side or "BUY") == "BUY" else (entry - close_price) * qty
+            pnl_pct = ((close_price - entry) / entry * 100.0) if entry > 0 else 0.0
+            sl = float(st.stop_loss or 0.0)
+            tp = float(st.take_profit or 0.0)
+            sl_pct = ((sl / entry - 1.0) * 100.0) if entry > 0 and sl > 0 else 0.0
+            tp_pct = ((tp / entry - 1.0) * 100.0) if entry > 0 and tp > 0 else 0.0
+            # Trail stop and peak
+            retrace = float(self.config.get("trailing_retrace_percent", 0.25))
+            peak_px = float(st.max_price_since_entry or 0.0)
+            trail_stop = peak_px * (1.0 - retrace / 100.0) if peak_px > 0 else 0.0
+            trail_percent = ((trail_stop / entry - 1.0) * 100.0) if entry > 0 and trail_stop > 0 else 0.0
+            peak_percent = ((peak_px - entry) / entry * 100.0) if entry > 0 and peak_px > 0 else 0.0
+            from datetime import datetime as _dt
+            ts = _dt.utcnow().isoformat() + "Z"
+            row = (
+                f"{ts},{symbol},{st.side or ''},{qty:.6f},{entry:.6f},{close_price:.6f},{value:.6f},{pnl_usdt:.6f},{pnl_pct:.2f},{sl:.6f},{sl_pct:.2f},{tp:.6f},{tp_pct:.2f},{trail_stop:.6f},{trail_percent:.2f},{peak_percent:.2f},{int(elapsed)},{reason}\n"
+            )
+            with self._closed_positions_csv.open("a", encoding="utf-8") as f:
+                f.write(row)
+        except Exception:
+            pass
 
     def run(self) -> None:
         threads = []
@@ -703,6 +746,8 @@ class SpotBotV2:
                     if ok:
                         self.logger.log(event=f"EXIT_{exit_reason}", symbol=symbol, side=st.side, quantity=st.quantity, price=price, entry_price=st.entry_price, exit_price=price, pnl=pnl, pnl_percent=pnl_percent, reason=exit_reason)
                         self.log.info("%s EXIT %s ok qty=%.6f price=%.6f pnl=%.6f (%.2f%%)", symbol, exit_reason, st.quantity, price, pnl, pnl_percent)
+                        # Snapshot closed position for later what-if analysis
+                        self._record_closed_snapshot(symbol=symbol, st=st, close_price=price, elapsed=elapsed, reason=exit_reason)
                         self.summary_logger.log_result(symbol=symbol, side=st.side, quantity=st.quantity, executed_qty=executed_qty, residual_qty=residual_qty, entry_price=st.entry_price, exit_price=price, entry_time=st.entry_time, exit_time=now, pnl_usdt=pnl, pnl_percent=pnl_percent, exit_reason=exit_reason)
                         st.in_position = False
                         st.side = None
