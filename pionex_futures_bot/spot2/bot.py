@@ -242,6 +242,21 @@ class SpotBotV2:
             return 0.0
         return 0.0
 
+    def _get_free_quote_balance(self, symbol: str) -> float:
+        # For now, all are *_USDT pairs
+        try:
+            r = self.client.get_balances()
+            if not r.ok or not r.data:
+                return 0.0
+            arr = (r.data.get("data") or {}).get("balances") if isinstance(r.data, dict) else None
+            if isinstance(arr, list):
+                for b in arr:
+                    if isinstance(b, dict) and str(b.get("coin","")) == "USDT":
+                        return float(b.get("free", 0.0))
+        except Exception:
+            return 0.0
+        return 0.0
+
     def run(self) -> None:
         threads = []
         # Resume check: log any positions found in state store
@@ -412,15 +427,17 @@ class SpotBotV2:
                             return
                     except Exception:
                         pass
-                    # Place maker-preferred entry
+                    # Place entry (respect config: maker/market handled by ExecutionLayer)
                     amt = self.position_usdt
-                    pre_free = self._get_free_base_balance(symbol)
+                    pre_free_base = self._get_free_base_balance(symbol)
+                    pre_free_quote = self._get_free_quote_balance(symbol)
                     resp = self.exec.place_entry(symbol=symbol, price_hint=price, amount_usdt=amt, client_order_id=None)
                     if resp.get("ok"):
                         st.in_position = True
                         st.side = "BUY"
+                        # Default estimate prior to verification
                         st.entry_price = price
-                        st.quantity = max(0.0, amt / price)
+                        st.quantity = max(0.0, amt / max(price, 1e-12))
                         st.entry_time = now
                         # Compute baseline SL/TP for display/control
                         stop_loss_percent = float(self.config.get("stop_loss_percent", 2.0))
@@ -443,25 +460,48 @@ class SpotBotV2:
                                     if fills.ok and fills.data:
                                         arr = (fills.data.get("data") or {}).get("fills") if isinstance(fills.data, dict) else None
                                         if isinstance(arr, list) and arr:
-                                            qsum = 0.0; notional = 0.0
+                                            qsum = 0.0; notional = 0.0; fee_total = 0.0
                                             for f in arr:
                                                 try:
                                                     qf = float(f.get("size", 0.0)); pf = float(f.get("price", 0.0))
+                                                    fee = f.get("fee")
                                                 except Exception:
-                                                    qf = 0.0; pf = 0.0
+                                                    qf = 0.0; pf = 0.0; fee = None
                                                 qsum += qf; notional += qf * pf
+                                                # Fee might be charged in quote or base; if in quote, reduce notional; if in base, reduce qty
+                                                try:
+                                                    if isinstance(fee, dict):
+                                                        fv = float(fee.get("amount", 0.0)); fc = str(fee.get("currency", "")).upper()
+                                                        if fc == "USDT":
+                                                            fee_total += fv
+                                                        elif fc == self._base_asset(symbol).upper():
+                                                            qsum = max(0.0, qsum - fv)
+                                                    elif fee is not None:
+                                                        fv = float(fee); fee_total += fv
+                                                except Exception:
+                                                    pass
                                             if qsum > 0:
+                                                # Only update real obtained quantity; keep entry_price unchanged
                                                 st.quantity = qsum
-                                                st.entry_price = (notional / qsum) if notional > 0 else st.entry_price
-                                                self.state_store.update_symbol(symbol, {"quantity": st.quantity, "entry_price": st.entry_price})
-                            # Ajustement via delta de balance (couvre résidus/fees)
-                            post_free = self._get_free_base_balance(symbol)
-                            delta_q = max(0.0, post_free - pre_free)
-                            # Only adjust if delta confirms a fill comparable to expected qty
-                            if delta_q > 0:
-                                if abs(delta_q - st.quantity) / max(1e-12, st.quantity) < 0.2 or delta_q > st.quantity * 0.8:
-                                    self.log.info("%s ENTRY balance adjust: qty %.6f -> %.6f (delta=%+.6f)", symbol, st.quantity, delta_q, delta_q - st.quantity)
-                                    st.quantity = delta_q
+                                                self.state_store.update_symbol(symbol, {"quantity": st.quantity})
+                            # Ajustement via delta de balances (source de vérité: variation quote et base)
+                            post_free_base = self._get_free_base_balance(symbol)
+                            delta_q_base = max(0.0, post_free_base - pre_free_base)
+                            if delta_q_base > 0:
+                                # Respect basePrecision step
+                                rules = self._symbol_rules.get(symbol) or self._symbol_rules.get(symbol.upper()) or {}
+                                base_prec = int(rules.get("basePrecision", 6)) if rules.get("basePrecision") is not None else 6
+                                if base_prec >= 0:
+                                    factor = 10 ** base_prec
+                                    delta_q_base = (int(delta_q_base * factor)) / factor
+                                if delta_q_base > 0:
+                                    # Set quantity to actual obtained; keep entry_price unchanged
+                                    new_qty = delta_q_base
+                                    self.log.info(
+                                        "%s ENTRY balance(base) confirm: qty=%.6f (invested %.4f USDT)",
+                                        symbol, new_qty, amt
+                                    )
+                                    st.quantity = new_qty
                                     self.state_store.update_symbol(symbol, {"quantity": st.quantity})
                         except Exception:
                             pass
