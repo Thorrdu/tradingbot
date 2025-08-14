@@ -25,7 +25,9 @@ class ExecutionLayer:
 
         # Pending maker orders store (JSON) for monitoring UI
         from pathlib import Path as _P
-        self._pending_path = _P("spot2/logs/pending_orders.json")
+        # Anchor to this module directory to avoid cwd-dependent paths
+        base_dir = _P(__file__).resolve().parent
+        self._pending_path = base_dir / "logs" / "pending_orders.json"
         try:
             self._pending_path.parent.mkdir(parents=True, exist_ok=True)
         except Exception:

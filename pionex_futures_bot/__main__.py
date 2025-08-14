@@ -62,7 +62,7 @@ def main() -> None:
     p_spot2 = sub.add_parser("spot2", help="Démarrer le bot Spot v2 (maker + filtres + z dynamique)")
     p_spot2.add_argument("--config", default="spot2/config/config.json", help="Chemin du fichier de configuration Spot2")
     p_spot2.add_argument("--print-config", action="store_true", help="Affiche un exemple de configuration et sort")
-    # Monitoring CLI pour spot2
+        # Monitoring CLI pour spot2
     p_spot2mon = sub.add_parser("spot2-monitor", help="Dashboard et monitoring du bot Spot v2 (rich)")
     p_spot2mon.add_argument("--summary", default="spot2/logs/trades_summary.csv", help="CSV de synthèse des trades")
     p_spot2mon.add_argument("--state", default="spot2/logs/runtime_state.json", help="Fichier d'état runtime")
@@ -120,9 +120,11 @@ def main() -> None:
         from datetime import datetime
         import time
         import csv, json as _J
-        summary_path = Path(args.summary)
-        state_path = Path(args.state)
-        trades_path = Path(args.trades)
+        # Normalize to project-root anchored paths to avoid cwd surprises
+        pkg_root = Path(__file__).resolve().parent
+        summary_path = (pkg_root / args.summary) if not Path(args.summary).is_absolute() else Path(args.summary)
+        state_path = (pkg_root / args.state) if not Path(args.state).is_absolute() else Path(args.state)
+        trades_path = (pkg_root / args.trades) if not Path(args.trades).is_absolute() else Path(args.trades)
         # API client for live price lookups (read-only, dry-run)
         try:
             from pionex_futures_bot.spot2.clients.pionex_client import PionexClient as _MonClient  # type: ignore
@@ -344,7 +346,7 @@ def main() -> None:
             # Pending maker orders panel (if any)
             tbl_pend = None
             try:
-                pend_path = Path("spot2/logs/pending_orders.json")
+                pend_path = pkg_root / "spot2/logs/pending_orders.json"
                 pending = _J.loads(pend_path.read_text(encoding="utf-8")) if pend_path.exists() else {}
             except Exception:
                 pending = {}

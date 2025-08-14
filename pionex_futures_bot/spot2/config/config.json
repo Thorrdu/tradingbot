@@ -32,6 +32,9 @@
   "check_interval_sec": 4,
   
   "cooldown_sec": 300,
+  "post_sl_cooldown_sec": 900,
+  "trend_lookback_sec": 300,
+  "downtrend_block_change_percent": 1.0,
   "idle_backoff_sec": 24,
   "force_min_sell": true,
   

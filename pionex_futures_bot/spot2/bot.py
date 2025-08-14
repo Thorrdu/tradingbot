@@ -49,7 +49,9 @@ class SpotBotV2:
         self.log = logging.getLogger("spot2")
         try:
             from pathlib import Path as _P
-            logs_dir = _P("spot2/logs")
+            # Anchor logs directory to package root to avoid cwd-dependent writes
+            pkg_root = _P(__file__).resolve().parent.parent
+            logs_dir = pkg_root / "spot2" / "logs"
             logs_dir.mkdir(parents=True, exist_ok=True)
             formatter = logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s", "%Y-%m-%d %H:%M:%S")
             # File handler
@@ -109,7 +111,9 @@ class SpotBotV2:
         # Load symbols trading rules (min/max, precisions)
         import json as _J
         from pathlib import Path as _P
-        rules_path = _P(self.config.get("symbols_rules_path", "spot2/config/symbols.json"))
+        pkg_root = _P(__file__).resolve().parent.parent
+        rules_cfg = self.config.get("symbols_rules_path", "spot2/config/symbols.json")
+        rules_path = (pkg_root / rules_cfg) if not _P(rules_cfg).is_absolute() else _P(rules_cfg)
         self._symbol_rules: Dict[str, dict] = {}
         try:
             if rules_path.exists():
@@ -158,20 +162,32 @@ class SpotBotV2:
         # Throttling caps
         self.max_open_trades = int(self.config.get("max_open_trades", 1))
         self.max_open_trades_per_symbol = int(self.config.get("max_open_trades_per_symbol", 1))
+        # Cooldowns and trend filters
+        self.cooldown_sec = int(self.config.get("cooldown_sec", 300))
+        self.post_sl_cooldown_sec = int(self.config.get("post_sl_cooldown_sec", max(600, self.cooldown_sec)))
+        self.trend_lookback_sec = int(self.config.get("trend_lookback_sec", max(300, self.breakout_lookback_sec * 3)))
+        self.downtrend_block_change_percent = float(self.config.get("downtrend_block_change_percent", 1.0))
 
         # State
         self._states: Dict[str, SymbolState] = {s: SymbolState() for s in self.symbols}
         from collections import deque as _dq
         self._vol_state: Dict[str, VolatilityState] = {s: VolatilityState(ewm_var=0.0, window=_dq(maxlen=300)) for s in self.symbols}
         self._z_hist: Dict[str, ZScoreHistory] = {s: ZScoreHistory() for s in self.symbols}
+        # Per-symbol cooldowns and last exit reason
+        self._cooldown_until: Dict[str, float] = {s: 0.0 for s in self.symbols}
+        self._last_exit_reason: Dict[str, str] = {}
         # Chemins dédiés à spot2
-        self.state_store = StateStore(self.config.get("state_file", "spot2/logs/runtime_state.json"))
-        self.logger = TradeLogger(self.config.get("log_csv", "spot2/logs/trades.csv"))
-        self.summary_logger = TradeSummaryLogger(self.config.get("summary_csv", "spot2/logs/trades_summary.csv"))
+        # Resolve log/state paths relative to package root
+        def _pkg_path(p: str) -> str:
+            pp = _P(p)
+            return str(pp if pp.is_absolute() else (pkg_root / p))
+        self.state_store = StateStore(_pkg_path(self.config.get("state_file", "spot2/logs/runtime_state.json")))
+        self.logger = TradeLogger(_pkg_path(self.config.get("log_csv", "spot2/logs/trades.csv")))
+        self.summary_logger = TradeSummaryLogger(_pkg_path(self.config.get("summary_csv", "spot2/logs/trades_summary.csv")))
         # Closed positions snapshot file (for post-mortem analysis)
         try:
             from pathlib import Path as _P
-            self._closed_positions_csv = _P(self.config.get("closed_positions_csv", "spot2/logs/closed_positions.csv"))
+            self._closed_positions_csv = _P(_pkg_path(self.config.get("closed_positions_csv", "spot2/logs/closed_positions.csv")))
             self._closed_positions_csv.parent.mkdir(parents=True, exist_ok=True)
             if not self._closed_positions_csv.exists():
                 self._closed_positions_csv.write_text(
@@ -363,7 +379,7 @@ class SpotBotV2:
             now = time.time()
             # Append current tick to history and trim old samples beyond lookback window (to keep ref moving)
             price_hist.append((now, price))
-            cutoff_keep = now - max(self.breakout_lookback_sec * 2, self.breakout_lookback_sec + 10)
+            cutoff_keep = now - max(self.breakout_lookback_sec * 2, self.trend_lookback_sec + 10)
             # Remove old samples from the front
             if len(price_hist) > 1:
                 try:
@@ -378,8 +394,22 @@ class SpotBotV2:
                 if ts <= cutoff:
                     ref = px
                     break
+            # Longer-term trend reference
+            trend_ref = price
+            tcut = now - self.trend_lookback_sec
+            for ts, px in reversed(price_hist):
+                if ts <= tcut:
+                    trend_ref = px
+                    break
             if not st.in_position:
+                # Per-symbol cooldown after exits (esp. SL)
+                if now < self._cooldown_until.get(symbol, 0.0):
+                    time.sleep(self.check_interval_sec)
+                    tick += 1
+                    continue
                 change_pct = (price - ref) / ref * 100.0
+                # Block contrarian entries during strong downtrends
+                trend_change_pct = (price - trend_ref) / trend_ref * 100.0 if trend_ref > 0 else 0.0
                 # update vol and z history (ret based on last observed tick)
                 ret_pct = 0.0
                 try:
@@ -422,6 +452,7 @@ class SpotBotV2:
                 if can_enter:
                     # Pre-check: ensure that minimum exit constraints are satisfiable given position_usdt
                     try:
+                        amt = self.position_usdt
                         # Resolve rules
                         rules = self.exec._resolve_rules(symbol)
                         min_size = float(rules.get("minTradeSize")) if rules.get("minTradeSize") is not None else None
@@ -749,6 +780,10 @@ class SpotBotV2:
                         # Snapshot closed position for later what-if analysis
                         self._record_closed_snapshot(symbol=symbol, st=st, close_price=price, elapsed=elapsed, reason=exit_reason)
                         self.summary_logger.log_result(symbol=symbol, side=st.side, quantity=st.quantity, executed_qty=executed_qty, residual_qty=residual_qty, entry_price=st.entry_price, exit_price=price, entry_time=st.entry_time, exit_time=now, pnl_usdt=pnl, pnl_percent=pnl_percent, exit_reason=exit_reason)
+                        # Apply cooldowns after exit to avoid immediate re-entries in adverse regimes
+                        self._last_exit_reason[symbol] = exit_reason
+                        cdur = self.post_sl_cooldown_sec if exit_reason == "SL" else self.cooldown_sec
+                        self._cooldown_until[symbol] = max(self._cooldown_until.get(symbol, 0.0), now + max(0, int(cdur)))
                         st.in_position = False
                         st.side = None
                         st.quantity = 0.0
